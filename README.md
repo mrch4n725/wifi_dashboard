@@ -4,7 +4,7 @@ WiFi Dashboard is an Android network-administration control surface. Android rep
 
 ## Current milestone
 
-Milestone 1 establishes the Android app foundation, a dark Compose dashboard, and live inspection of the Android device's active network and Wi-Fi connection. It reports only values supplied by Android and labels device-wide traffic counters as system-wide. See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for what is and is not implemented.
+Milestone 1 establishes the Android app foundation, dark Compose dashboard, and live inspection of the Android device's active network and Wi-Fi connection. Milestone 2 adds an on-device Room inventory populated by user-triggered, read-only cached-neighbor and selected mDNS observations. It does not discover every LAN client. See [IMPLEMENTATION_STATUS.md](IMPLEMENTATION_STATUS.md) for implementation and hardware-validation status.
 
 ## Build
 
@@ -12,9 +12,9 @@ Open the repository in Android Studio or follow [BUILD_APK.md](BUILD_APK.md). Th
 
 ## Scope and permissions
 
-The app does not extract saved Wi-Fi passwords, scan LAN hosts, or change router configuration in this milestone. Wi-Fi identifiers may be hidden by Android unless the relevant Nearby devices (Android 13+) or Location (Android 12 and earlier) permission is granted. Missing or restricted values are shown as unavailable, never inferred.
+The app does not extract saved Wi-Fi passwords, sweep LAN hosts, ping devices, or change router configuration. Device discovery is user-triggered, bounded mDNS service browsing plus the Android cached neighbor table; results are partial. Wi-Fi identifiers and local discovery are subject to Android Nearby devices (Android 13+) or Location (Android 12 and earlier) permission rules. Missing or restricted values are shown as unavailable, never inferred.
 
-Router-side device discovery, inventory, and controls are planned for later milestones. No cloud backend is required or planned.
+Router-side authoritative client discovery and controls are planned for later milestones. No cloud backend is required or planned. Android system-wide traffic totals are not per-device or router traffic.
 
 ## Development
 
