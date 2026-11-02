@@ -1,0 +1,26 @@
+package com.wifidashboard.network
+
+data class NetworkSnapshot(
+    val capturedAtMillis: Long,
+    val connectionState: String,
+    val transport: String?,
+    val interfaceName: String?,
+    val ssid: String?,
+    val bssid: String?,
+    val security: String?,
+    val frequencyMhz: Int?,
+    val channel: Int?,
+    val band: String?,
+    val rssiDbm: Int?,
+    val linkSpeedMbps: Int?,
+    val rxLinkSpeedMbps: Int?,
+    val txLinkSpeedMbps: Int?,
+    val ipv4Addresses: List<String>,
+    val ipv6Addresses: List<String>,
+    val prefixes: List<String>,
+    val gateways: List<String>,
+    val dnsServers: List<String>,
+    val dhcpServer: String?,
+    val systemRxBytes: Long?,
+    val systemTxBytes: Long?,
+)
