@@ -27,6 +27,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Dashboard
 import androidx.compose.material.icons.filled.Devices
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Router
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material3.Button
@@ -84,6 +85,7 @@ import kotlinx.coroutines.withContext
 private enum class Destination(val title: String) {
     Dashboard("Dashboard"),
     Devices("Devices"),
+    Router("Router"),
     Wifi("Wi-Fi"),
     Settings("Settings"),
 }
@@ -158,6 +160,7 @@ fun WifiDashboardApp() {
                     val icon = when (item) {
                         Destination.Dashboard -> Icons.Default.Dashboard
                         Destination.Devices -> Icons.Default.Devices
+                        Destination.Router -> Icons.Default.Router
                         Destination.Wifi -> Icons.Default.Wifi
                         Destination.Settings -> Icons.Default.Settings
                     }
@@ -195,6 +198,10 @@ fun WifiDashboardApp() {
                 onRequestPermission = {
                     permissionLauncher.launch(requiredWifiPermissions())
                 },
+                repository = deviceRepository,
+                modifier = Modifier.padding(padding),
+            )
+            Destination.Router -> OpenWrtScreen(
                 repository = deviceRepository,
                 modifier = Modifier.padding(padding),
             )
@@ -727,7 +734,7 @@ private fun SettingsScreen(
                 rows = listOf(
                     "Permission" to if (permissionGranted) "Granted" else "Not granted",
                     "Data handling" to "Read from Android; not uploaded",
-                    "Router controls" to "Not available in Milestone 1",
+                    "Router integration" to "OpenWrt read-only inspection is available",
                 ),
                 action = if (permissionGranted) null else "Grant permission",
                 onAction = if (permissionGranted) null else onRequestPermission,
@@ -735,7 +742,7 @@ private fun SettingsScreen(
         }
         item {
             Text(
-                "This app currently inspects the phone's active connection only. Router administration and persistent device inventory will be added in later milestones; no controls are simulated.",
+                "OpenWrt support currently provides authenticated, read-only router inspection. Enforcement and configuration controls are not yet available; no controls are simulated.",
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
