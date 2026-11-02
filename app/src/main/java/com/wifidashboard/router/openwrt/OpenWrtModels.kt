@@ -82,6 +82,7 @@ data class RouterClient(
     val hostname: String?,
     val source: String,
     val details: String?,
+    val networkInterface: String? = null,
 )
 
 data class RouterSnapshot(

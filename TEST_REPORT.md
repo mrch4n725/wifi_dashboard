@@ -1,13 +1,25 @@
 # Test report
 
-## Milestones 1–3
+## Milestones 1–4
 
 - Ran `./gradlew --no-daemon --max-workers=1 testDebugUnitTest lintDebug assembleDebug` successfully with JDK 17 and Android SDK 36.
-- **Unit tests:** 14 passed, 0 failures, 0 errors: Wi-Fi channel/band mapping, byte-counter formatting, identity selection, neighbor parsing, Room persistence, and four OpenWrt endpoint/protocol/capability tests.
+- **Unit tests:** 21 passed, 0 failures, 0 errors, 0 skipped. Coverage includes Wi-Fi formatting, identity and neighbor parsing, Room persistence/migration, OpenWrt RPC and DHCP lease parsing, and internet access policy transactions.
 - **Android lint:** passed with seven dependency-version advisories and no reported errors.
-- **Debug APK:** assembled and ZIP-validated at `app/build/outputs/apk/debug/app-debug.apk` (17,949,537 bytes; package `com.wifidashboard`; min SDK 26, target SDK 36).
-- **SHA-256:** `bf59a2942bcee09de30bbaee07dc120e2fd8fc7dd4ce529ba7957d9bdd241d0a`
+- **Debug APK:** assembled at `app/build/outputs/apk/debug/app-debug.apk` (package `com.wifidashboard`; min SDK 26, target SDK 36).
+- **SHA-256:** `8901c1fb5fd530948fc7d35ffa6f77d6115a677aaf3476f4580f09c16265cb3b`
 - **Workflow YAML:** parsed locally; GitHub Actions has not yet run because the changes have not been pushed.
 - **Physical-device/LAN/router validation:** pending; no Android device or OpenWrt router is available in the current workspace. Android discovery behavior and real rpcd response compatibility are therefore not hardware-verified. Protocol tests use representative mocked JSON-RPC responses.
 
 CI also validates APK existence, calculates a checksum, and publishes the APK artifact. A successful build does not replace checking permission behavior and reported values on representative Android versions.
+
+## Milestone 4 — transactional device internet access controls
+
+- Added focused unit coverage for stable app-owned policy identity, invalid MAC rejection, supported OpenWrt UCI transaction ordering, and unsupported firewall layouts; added Room audit-event persistence coverage.
+- Final verification after DHCP interface parsing and interface-to-firewall-zone mapping changes: `testDebugUnitTest`, `lintDebug`, and `assembleDebug` all succeeded.
+- **Unit tests:** 21 passed, 0 failures, 0 errors, 0 skipped.
+- **Android lint:** passed with seven dependency-version advisory warnings and no lint errors.
+- **Debug APK:** `app/build/outputs/apk/debug/app-debug.apk`.
+- **SHA-256:** `8901c1fb5fd530948fc7d35ffa6f77d6115a677aaf3476f4580f09c16265cb3b`.
+- For this run, JDK 17 and Android Build Tools 35.0.0/platform 36 were installed in the workspace SDK after SDK license acceptance. Robolectric required `-Duser.home=/home/osama/Documents/Codex` because the default home directory is read-only.
+- DHCP leases use the router's interface-keyed `dhcp.ipv4leases` response; access control requires the reported interface to resolve to exactly one firewall zone with WAN forwarding. The operation verifies the saved UCI rule only; it cannot verify the selected device's actual internet connectivity.
+- **Router validation:** pending. No physical OpenWrt router is attached.

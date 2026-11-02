@@ -34,13 +34,24 @@
 - Strict router-origin validation; HTTPS by default. Cleartext HTTP is only accepted after an explicit in-app user acknowledgement.
 - Authenticated `session.login`, per-session calls, explicit `session.logout`, and capability detection via `list`. Unsupported methods are not called; router and method errors remain visible.
 - Capability-gated reads for `system.board`, `system.info`, `network.interface.dump`, `dhcp.ipv4leases`, and advertised `hostapd.*.get_clients` methods.
-- Router, interface, DHCP lease, and wireless-client results are shown as router-provided data. Reported clients are recorded in the existing Room inventory with their discovery source.
+- Router, interface, DHCP lease, and wireless-client results are shown as router-provided data. DHCP leases retain their reported network interface; reported clients are recorded in the existing Room inventory with their discovery source.
 - Optional saved credentials use AES-GCM encryption with a per-router Android Keystore key; plaintext passwords and session tokens are not logged or persisted.
 - Robolectric protocol tests cover endpoint checks, login/capability discovery, returned router data, unsupported methods, and ubus status failures.
 
+## Milestone 4 — Transactional device internet access controls
+
+**Status: implemented and build/test-verified; real-router validation remains pending.**
+
+- Added capability-gated OpenWrt UCI preview and apply operations. The adapter requires the needed `uci` read/write/transaction calls, maps the DHCP-reported client interface to exactly one firewall zone, and requires a `wan` zone plus forwarding from the client zone to WAN.
+- Block creates one deterministic named app-owned `REJECT` rule for a router-reported MAC and moves only that rule to the start of the firewall section order. Restore deletes only that app-owned rule. IP-only identities are not accepted.
+- Each change re-reads firewall configuration before mutation, refuses pre-existing staged changes or conflicting app-owned names, applies with a 45-second rollback window, checks the resulting UCI configuration, and confirms only if it matches. The status is `APPLIED`; the API cannot verify the target device's real internet connectivity.
+- Added an explicit action preview/confirmation, interface-aware client controls in the OpenWrt screen, randomized-MAC and stale-observation explanations, and a local Room audit trail for requested/final outcomes. A later inventory refresh failure no longer changes a successfully applied operation into a failed audit result.
+- Added a Room 1→2 migration for audit records. Router ACLs may deny UCI operations; custom zones and nonstandard policy layouts are unsupported and fail closed.
+- Verification: 21 unit tests passed; Android lint and debug APK assembly passed. Lint reported seven dependency-version advisories. Physical Android/OpenWrt testing remains pending.
+
 ## Explicitly not implemented
 
-Router enforcement and configuration remain unimplemented: firewall/device controls, Wi-Fi configuration, DHCP/DNS configuration, QoS, port forwarding, per-device/router traffic analytics, diagnostics, topology map, scheduling, and quarantine. Android-only discovery sources are partial and do not determine current connection status. The UI does not claim these features work.
+Wi-Fi configuration, DHCP/DNS configuration, QoS, port forwarding, per-device/router traffic analytics, diagnostics, topology map, scheduling, and quarantine remain unimplemented. Internet access controls are not verified against a physical OpenWrt router or end-device traffic. Android-only discovery sources are partial and do not determine current connection status. The UI does not claim unsupported features work.
 
 ## Validation caveat
 

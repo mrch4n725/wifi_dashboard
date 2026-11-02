@@ -12,6 +12,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Checkbox
@@ -26,6 +27,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
@@ -36,15 +38,21 @@ import com.wifidashboard.router.openwrt.OpenWrtAdapter
 import com.wifidashboard.router.openwrt.OpenWrtEndpoint
 import com.wifidashboard.router.openwrt.OpenWrtRouterSession
 import com.wifidashboard.router.openwrt.OpenWrtRpcException
+import com.wifidashboard.router.openwrt.AccessControlState
+import com.wifidashboard.router.openwrt.InternetAccessAction
+import com.wifidashboard.router.openwrt.InternetAccessPreview
 import com.wifidashboard.router.openwrt.RouterClient
 import com.wifidashboard.router.openwrt.RouterCredentialStore
 import com.wifidashboard.router.openwrt.RouterCredentials
 import com.wifidashboard.router.openwrt.RouterSnapshot
 import com.wifidashboard.storage.DeviceIdentity
+import com.wifidashboard.storage.AccessControlEventEntity
 import com.wifidashboard.storage.DeviceObservation
 import com.wifidashboard.storage.DeviceRepository
 import java.io.IOException
+import java.text.DateFormat
 import java.security.GeneralSecurityException
+import java.util.Date
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -69,6 +77,43 @@ fun OpenWrtScreen(
     var snapshot by remember { mutableStateOf<RouterSnapshot?>(null) }
     var busy by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf<String?>(null) }
+    var pendingPreview by remember { mutableStateOf<InternetAccessPreview?>(null) }
+    var pendingClient by remember { mutableStateOf<RouterClient?>(null) }
+    val auditEvents by repository.observeRecentAccessControlEvents()
+        .collectAsStateWithLifecycle(initialValue = emptyList())
+
+    fun requestAccessChange(client: RouterClient, action: InternetAccessAction) {
+        val activeSession = session ?: run {
+            message = "Connect to the router before changing device access."
+            return
+        }
+        val mac = client.macAddress ?: run {
+            message = "Router did not report a MAC address for this client; access control is unavailable."
+            return
+        }
+        val networkInterface = client.networkInterface ?: run {
+            message = "The router did not associate this client with a network interface; access control is unavailable."
+            return
+        }
+        busy = true
+        message = "Checking router support and firewall configuration…"
+        scope.launch {
+            try {
+                val preview = withContext(Dispatchers.IO) {
+                    activeSession.previewInternetAccess(mac, networkInterface, action)
+                }
+                pendingClient = client
+                pendingPreview = preview
+                message = null
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: IOException) {
+                message = error.message ?: "Router could not prepare an access-control preview."
+            } finally {
+                busy = false
+            }
+        }
+    }
 
     Column(
         modifier = modifier
@@ -181,7 +226,7 @@ fun OpenWrtScreen(
                             password = ""
                             message = result.third
                                 ?: if (result.first.capabilities.detected) {
-                                    "Connected and authenticated. Router data is read-only."
+                                    "Connected and authenticated. Router inspection is available; access control depends on advertised UCI capabilities and the router’s firewall layout."
                                 } else {
                                     result.first.capabilities.detectionMessage
                                         ?: "Connected, but router capabilities could not be detected"
@@ -303,12 +348,139 @@ fun OpenWrtScreen(
                 }
             }
         }
-        snapshot?.let { RouterInformation(it) }
+        snapshot?.let { latest ->
+            RouterInformation(
+                snapshot = latest,
+                onBlock = { requestAccessChange(it, InternetAccessAction.BLOCK) },
+                onRestore = { requestAccessChange(it, InternetAccessAction.RESTORE) },
+            )
+        }
+        if (auditEvents.isNotEmpty()) AccessControlAudit(auditEvents)
+    }
+
+    val preview = pendingPreview
+    val client = pendingClient
+    if (preview != null && client != null) {
+        AlertDialog(
+            onDismissRequest = {
+                if (!busy) {
+                    pendingPreview = null
+                    pendingClient = null
+                }
+            },
+            title = {
+                Text(if (preview.action == InternetAccessAction.BLOCK) "Block internet access?" else "Restore internet access?")
+            },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("${client.displayName()} (${preview.policy.macAddress})")
+                    Text(
+                        when {
+                            preview.action == InternetAccessAction.BLOCK && preview.existingSection ->
+                                "This device already has the app-owned block policy."
+                            preview.action == InternetAccessAction.BLOCK ->
+                                "Add one app-owned REJECT rule for this device from ${preview.policy.sourceZone} to WAN."
+                            else -> "Remove only this app-owned device rule from the router firewall."
+                        },
+                    )
+                    Text("The router will apply the firewall change with a 45-second rollback window. After checking the saved rule, the app will confirm it. Router configuration acceptance does not verify the device’s actual internet connectivity.")
+                    Text("The rule uses this MAC address. Some devices use randomized MAC addresses, which can change and appear as a different identity.")
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val activeSession = session ?: return@Button
+                        val identity = runCatching {
+                            DeviceIdentity.from(
+                                DeviceObservation(
+                                    source = "OpenWrt access control",
+                                    observedAt = System.currentTimeMillis(),
+                                    macAddress = preview.policy.macAddress,
+                                ),
+                            )
+                        }.getOrNull()?.key ?: "mac:${preview.policy.macAddress}"
+                        busy = true
+                        message = "Applying router firewall change…"
+                        scope.launch {
+                            try {
+                                val applied = withContext(Dispatchers.IO) {
+                                    repository.recordAccessControlEvent(
+                                        AccessControlEventEntity(
+                                            deviceId = identity,
+                                            deviceLabel = client.displayName(),
+                                            macAddress = preview.policy.macAddress,
+                                            action = preview.action.name,
+                                            state = AccessControlState.REQUESTED.name,
+                                            occurredAt = System.currentTimeMillis(),
+                                            detail = "Administrator confirmed ${preview.action.name.lowercase()} request.",
+                                        ),
+                                    )
+                                    val result = activeSession.applyInternetAccess(preview)
+                                    repository.recordAccessControlEvent(
+                                        AccessControlEventEntity(
+                                            deviceId = identity,
+                                            deviceLabel = client.displayName(),
+                                            macAddress = preview.policy.macAddress,
+                                            action = preview.action.name,
+                                            state = result.state.name,
+                                            occurredAt = System.currentTimeMillis(),
+                                            detail = result.message,
+                                        ),
+                                    )
+                                    result
+                                }
+                                message = applied.message
+                                try {
+                                    val latest = withContext(Dispatchers.IO) { activeSession.inspect() }
+                                    withContext(Dispatchers.IO) { persistRouterClients(repository, latest) }
+                                    snapshot = latest
+                                } catch (refreshError: IOException) {
+                                    message = "${applied.message} Router inventory refresh failed: ${refreshError.message ?: "router unavailable"}."
+                                }
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: IOException) {
+                                withContext(Dispatchers.IO) {
+                                    repository.recordAccessControlEvent(
+                                        AccessControlEventEntity(
+                                            deviceId = identity,
+                                            deviceLabel = client.displayName(),
+                                            macAddress = preview.policy.macAddress,
+                                            action = preview.action.name,
+                                            state = AccessControlState.FAILED.name,
+                                            occurredAt = System.currentTimeMillis(),
+                                            detail = "Router operation failed; review the router response and reconnect if needed.",
+                                        ),
+                                    )
+                                }
+                                message = error.message ?: "Router access-control operation failed."
+                            } finally {
+                                pendingPreview = null
+                                pendingClient = null
+                                busy = false
+                            }
+                        }
+                    },
+                    enabled = !busy,
+                ) { Text("Confirm") }
+            },
+            dismissButton = {
+                TextButton(
+                    onClick = { pendingPreview = null; pendingClient = null },
+                    enabled = !busy,
+                ) { Text("Cancel") }
+            },
+        )
     }
 }
 
 @Composable
-private fun RouterInformation(snapshot: RouterSnapshot) {
+private fun RouterInformation(
+    snapshot: RouterSnapshot,
+    onBlock: (RouterClient) -> Unit,
+    onRestore: (RouterClient) -> Unit,
+) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         RouterCard(
             "ROUTER",
@@ -339,16 +511,40 @@ private fun RouterInformation(snapshot: RouterSnapshot) {
                 ).joinToString(" · ")
             } ?: listOf("Interface data" to "Not supported by this router"),
         )
-        RouterCard(
-            "DHCP LEASES",
-            snapshot.dhcpLeases.map { it.displayName() to it.displayAddress() }
-                .ifEmpty { listOf("Leases" to "None reported or unsupported") },
+        val reportedClients = (snapshot.dhcpLeases + snapshot.wirelessClients)
+            .distinctBy { it.macAddress?.lowercase() ?: "${it.source}:${it.ipAddress}:${it.hostname}" }
+        Text(
+            "CLIENT INTERNET ACCESS",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.primary,
+            fontWeight = FontWeight.Bold,
         )
-        RouterCard(
-            "WIRELESS CLIENTS",
-            snapshot.wirelessClients.map { it.displayName() to it.displayAddress() }
-                .ifEmpty { listOf("Clients" to "None reported or unsupported") },
-        )
+        if (reportedClients.isEmpty()) {
+            Text(
+                "No router-reported clients are available. Client-level controls require a router-reported MAC address.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        reportedClients.forEach { client ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+            ) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(client.displayName(), fontWeight = FontWeight.SemiBold)
+                    Text(client.displayAddress(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(
+                        "Router-reported observation; this does not by itself prove the device is currently online.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(onClick = { onBlock(client) }, enabled = client.macAddress != null && client.networkInterface != null) { Text("Block internet") }
+                        TextButton(onClick = { onRestore(client) }, enabled = client.macAddress != null && client.networkInterface != null) { Text("Restore") }
+                    }
+                }
+            }
+        }
         if (snapshot.capabilities.methods.isNotEmpty()) {
             RouterCard(
                 "DETECTED RPC METHODS",
@@ -363,11 +559,22 @@ private fun RouterInformation(snapshot: RouterSnapshot) {
             })
         }
         Text(
-            "All information above is router-reported and read-only. Unsupported methods are omitted; no firewall, wireless, or device configuration has been changed.",
+            "Client controls use an app-owned OpenWrt firewall rule only when this router advertises the required UCI methods and maps the reported client interface to a firewall zone with WAN forwarding. The app reports router configuration acceptance, not verified end-device connectivity.",
             style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
+}
+
+@Composable
+private fun AccessControlAudit(events: List<AccessControlEventEntity>) {
+    RouterCard(
+        "RECENT ACCESS CONTROL AUDIT",
+        events.map { event ->
+            "${event.action} · ${event.state} · ${event.deviceLabel}" to
+                "${event.macAddress} · ${DateFormat.getDateTimeInstance().format(Date(event.occurredAt))} · ${event.detail}"
+        },
+    )
 }
 
 @Composable

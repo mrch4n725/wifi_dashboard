@@ -75,3 +75,12 @@ interface DeviceDao {
     @Query("UPDATE devices SET groupName = :groupName WHERE identityKey = :deviceId")
     suspend fun updateGroup(deviceId: String, groupName: String?)
 }
+
+@Dao
+interface AccessControlAuditDao {
+    @Query("SELECT * FROM access_control_events ORDER BY occurredAt DESC LIMIT 20")
+    fun observeRecent(): Flow<List<AccessControlEventEntity>>
+
+    @Insert
+    suspend fun insert(event: AccessControlEventEntity)
+}

@@ -13,6 +13,13 @@ class DeviceRepository(private val database: NetworkDatabase) {
     fun observeHistory(deviceId: String): Flow<List<DeviceObservationEntity>> =
         dao.observeHistory(deviceId)
 
+    fun observeRecentAccessControlEvents(): Flow<List<AccessControlEventEntity>> =
+        database.accessControlAuditDao().observeRecent()
+
+    suspend fun recordAccessControlEvent(event: AccessControlEventEntity) {
+        database.accessControlAuditDao().insert(event)
+    }
+
     suspend fun record(observation: DeviceObservation): String {
         val identity = DeviceIdentity.from(observation)
         val identityKey = identity.key

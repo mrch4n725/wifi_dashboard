@@ -6,6 +6,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.assertThrows
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
@@ -73,15 +74,16 @@ class OpenWrtAdapterTest {
             success(
                 JSONObject().put(
                     "device",
-                    JSONArray().put(
+                    JSONObject().put(
+                        "lan",
                         JSONObject().put(
                             "leases",
                             JSONArray().put(
                                 JSONObject()
                                     .put("hostname", "printer")
-                                    .put("ipaddr", "192.168.1.42")
-                                    .put("macaddr", "aa:bb:cc:dd:ee:ff")
-                                    .put("expires", 300),
+                                    .put("address", "192.168.1.42")
+                                    .put("mac", "aa:bb:cc:dd:ee:ff")
+                                    .put("valid", 300),
                             ),
                         ),
                     ),
@@ -113,6 +115,8 @@ class OpenWrtAdapterTest {
         assertEquals("192.168.1.1", snapshot.interfaces?.single()?.addresses?.single())
         assertEquals("printer", snapshot.dhcpLeases.single().hostname)
         assertEquals("192.168.1.42", snapshot.dhcpLeases.single().ipAddress)
+        assertEquals("lan", snapshot.dhcpLeases.single().networkInterface)
+        assertTrue(snapshot.dhcpLeases.single().details.orEmpty().contains("300"))
         assertEquals("aa:bb:cc:dd:ee:ff", snapshot.wirelessClients.single().macAddress)
         assertTrue(snapshot.wirelessClients.single().details.orEmpty().contains("Signal -45 dBm"))
         assertTrue(snapshot.issues.isEmpty())
@@ -158,6 +162,170 @@ class OpenWrtAdapterTest {
         assertTrue(session.capabilities.methods.isEmpty())
         assertTrue(session.capabilities.detectionMessage.orEmpty().contains("listing failed"))
         assertEquals(2, transport.requests.size)
+    }
+
+    @Test
+    fun internetAccessBlockUsesNamedAppRuleAndTimedApplyThenConfirmsOnlyAfterConfigCheck() {
+        val mac = "aa:bb:cc:dd:ee:ff"
+        val policy = InternetAccessPolicy.forDevice(mac, "lan")
+        val emptyFirewall = firewallConfig()
+        val blockedFirewall = firewallConfig(
+            JSONObject()
+                .put(".type", "rule")
+                .put(".name", policy.sectionName)
+                .put("name", "WiFi Dashboard internet access")
+                .put("src", "lan")
+                .put("dest", "wan")
+                .put("src_mac", mac)
+                .put("proto", "all")
+                .put("target", "REJECT"),
+        )
+        val transport = ResponseQueue(
+            success(JSONObject().put("ubus_rpc_session", "session")),
+            success(accessControlCapabilities()),
+            success(JSONObject().put("changes", JSONArray())),
+            success(emptyFirewall),
+            success(JSONObject().put("changes", JSONArray())),
+            success(emptyFirewall),
+            success(JSONObject().put("section", policy.sectionName)),
+            success(JSONObject()),
+            success(JSONObject()),
+            success(blockedFirewall),
+            success(JSONObject()),
+        )
+        val session = OpenWrtAdapter(transport).connect(
+            OpenWrtEndpoint.parse("https://router.local", allowCleartext = false),
+            RouterCredentials("root", "test-password"),
+        )
+        val preview = session.previewInternetAccess(mac, "lan", InternetAccessAction.BLOCK)
+
+        assertFalse(preview.existingSection)
+        assertEquals(
+            AccessControlState.APPLIED,
+            session.applyInternetAccess(preview).state,
+        )
+        val calls = transport.requests.filter { it.getString("method") == "call" }
+            .map { it.getJSONArray("params") }
+        val methods = calls.map { "${it.getString(1)}.${it.getString(2)}" }
+        assertTrue(methods.contains("uci.add"))
+        assertTrue(methods.contains("uci.order"))
+        assertTrue(methods.contains("uci.apply"))
+        assertTrue(methods.contains("uci.confirm"))
+        val applyArgs = calls.single { it.getString(2) == "apply" }.getJSONObject(3)
+        assertTrue(applyArgs.getBoolean("rollback"))
+        assertEquals(45, applyArgs.getInt("timeout"))
+    }
+
+    @Test
+    fun internetAccessDoesNotModifyNonstandardFirewallZones() {
+        val transport = ResponseQueue(
+            success(JSONObject().put("ubus_rpc_session", "session")),
+            success(accessControlCapabilities()),
+            success(JSONObject().put("changes", JSONArray())),
+            success(firewallConfig(zones = listOf("home", "uplink"))),
+        )
+        val session = OpenWrtAdapter(transport).connect(
+            OpenWrtEndpoint.parse("https://router.local", allowCleartext = false),
+            RouterCredentials("root", "test-password"),
+        )
+
+        assertThrows(AccessControlNotSupportedException::class.java) {
+            session.previewInternetAccess("aa:bb:cc:dd:ee:ff", "lan", InternetAccessAction.BLOCK)
+        }
+        assertEquals(4, transport.requests.size)
+    }
+
+    @Test
+    fun internetAccessUsesTheSelectedClientInterfaceZone() {
+        val firewall = firewallConfig()
+        val values = firewall.getJSONObject("values")
+            .put(
+                "cfg-guest",
+                JSONObject().put(".type", "zone").put(".name", "cfg-guest")
+                    .put("name", "guest").put("network", JSONArray().put("guest")),
+            )
+            .put(
+                "cfg-guest-forward",
+                JSONObject().put(".type", "forwarding").put(".name", "cfg-guest-forward")
+                    .put("src", "guest").put("dest", "wan"),
+            )
+        val transport = ResponseQueue(
+            success(JSONObject().put("ubus_rpc_session", "session")),
+            success(accessControlCapabilities()),
+            success(JSONObject().put("changes", JSONArray())),
+            success(firewall),
+        )
+        val session = OpenWrtAdapter(transport).connect(
+            OpenWrtEndpoint.parse("https://router.local", allowCleartext = false),
+            RouterCredentials("root", "test-password"),
+        )
+
+        val preview = session.previewInternetAccess("aa:bb:cc:dd:ee:ff", "guest", InternetAccessAction.BLOCK)
+
+        assertEquals("guest", preview.policy.sourceZone)
+    }
+
+    @Test
+    fun internetAccessRequestsRouterRollbackWhenReadBackDoesNotMatch() {
+        val mac = "aa:bb:cc:dd:ee:ff"
+        val firewall = firewallConfig()
+        val transport = ResponseQueue(
+            success(JSONObject().put("ubus_rpc_session", "session")),
+            success(accessControlCapabilities()),
+            success(JSONObject().put("changes", JSONArray())),
+            success(firewall),
+            success(JSONObject().put("changes", JSONArray())),
+            success(firewall),
+            success(JSONObject().put("section", InternetAccessPolicy.forDevice(mac, "lan").sectionName)),
+            success(JSONObject()),
+            success(JSONObject()),
+            success(firewall),
+            success(JSONObject()),
+        )
+        val session = OpenWrtAdapter(transport).connect(
+            OpenWrtEndpoint.parse("https://router.local", allowCleartext = false),
+            RouterCredentials("root", "test-password"),
+        )
+        val preview = session.previewInternetAccess(mac, "lan", InternetAccessAction.BLOCK)
+
+        val result = session.applyInternetAccess(preview)
+
+        assertEquals(AccessControlState.ROLLED_BACK, result.state)
+        val methods = transport.requests.filter { it.getString("method") == "call" }
+            .map { it.getJSONArray("params").getString(2) }
+        assertTrue(methods.contains("rollback"))
+        assertFalse(methods.contains("confirm"))
+    }
+
+    private fun accessControlCapabilities(): JSONObject =
+        JSONObject()
+            .put("uci", methods("get", "add", "delete", "order", "changes", "revert", "apply", "confirm", "rollback"))
+
+    private fun firewallConfig(
+        rule: JSONObject? = null,
+        zones: List<String> = listOf("lan", "wan"),
+    ): JSONObject {
+        val values = JSONObject()
+        zones.forEachIndexed { index, zone ->
+            values.put(
+                "cfg${index + 1}",
+                JSONObject()
+                    .put(".type", "zone")
+                    .put(".name", "cfg${index + 1}")
+                    .put("name", zone)
+                    .put("network", JSONArray().put(zone)),
+            )
+        }
+        values.put(
+            "cfg-forward",
+            JSONObject()
+                .put(".type", "forwarding")
+                .put(".name", "cfg-forward")
+                .put("src", "lan")
+                .put("dest", "wan"),
+        )
+        rule?.let { values.put(it.optString(".name"), it) }
+        return JSONObject().put("values", values)
     }
 
     private fun methods(vararg names: String): JSONObject =

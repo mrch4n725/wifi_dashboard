@@ -70,3 +70,15 @@ data class DeviceObservation(
     val serviceName: String? = null,
     val detail: String? = null,
 )
+
+@Entity(tableName = "access_control_events", indices = [Index(value = ["occurredAt"])])
+data class AccessControlEventEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val deviceId: String,
+    val deviceLabel: String,
+    val macAddress: String,
+    val action: String,
+    val state: String,
+    val occurredAt: Long,
+    val detail: String,
+)

@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added capability-gated, previewed OpenWrt per-device internet block/restore via app-owned firewall rules and UCI timed apply/rollback.
+- Parse interface-keyed OpenWrt DHCP leases and require an unambiguous client-interface-to-firewall-zone mapping with WAN forwarding before offering controls.
+- Added Room-backed access-control audit events, UI confirmation, and explicit wording that router config read-back does not verify actual device connectivity.
 - Initialized a Kotlin/Compose Android application with a live network dashboard and Wi-Fi detail view.
 - Added permission-aware Android network inspection, honest unavailable-value handling, and clearly labeled device-wide traffic counters.
 - Added unit tests and Android GitHub Actions build/artifact workflow.

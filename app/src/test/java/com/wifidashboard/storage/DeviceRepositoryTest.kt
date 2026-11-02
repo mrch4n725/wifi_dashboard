@@ -58,4 +58,35 @@ class DeviceRepositoryTest {
             database.close()
         }
     }
+
+    @Test
+    fun persistsAccessControlAuditEvents() = runBlocking {
+        val database = Room.inMemoryDatabaseBuilder(
+            ApplicationProvider.getApplicationContext<Context>(),
+            NetworkDatabase::class.java,
+        ).allowMainThreadQueries().build()
+
+        try {
+            val repository = DeviceRepository(database)
+            repository.recordAccessControlEvent(
+                AccessControlEventEntity(
+                    deviceId = "mac:aa:bb:cc:dd:ee:ff",
+                    deviceLabel = "Office laptop",
+                    macAddress = "aa:bb:cc:dd:ee:ff",
+                    action = "BLOCK",
+                    state = "APPLIED",
+                    occurredAt = 1_000L,
+                    detail = "Router accepted the policy; traffic verification unavailable.",
+                ),
+            )
+
+            val event = repository.observeRecentAccessControlEvents().first().single()
+            assertEquals("Office laptop", event.deviceLabel)
+            assertEquals("BLOCK", event.action)
+            assertEquals("APPLIED", event.state)
+            assertEquals(1_000L, event.occurredAt)
+        } finally {
+            database.close()
+        }
+    }
 }

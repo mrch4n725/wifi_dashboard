@@ -3,6 +3,7 @@ package com.wifidashboard.router.openwrt
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
+import java.security.MessageDigest
 
 class OpenWrtAdapter(
     private val transport: UbusTransport = HttpUbusTransport(),
@@ -71,6 +72,173 @@ class OpenWrtRouterSession internal constructor(
         )
     }
 
+    fun previewInternetAccess(
+        macAddress: String,
+        sourceInterface: String,
+        action: InternetAccessAction,
+    ): InternetAccessPreview {
+        check(!loggedOut) { "Router session is closed; reconnect to continue" }
+        require(sourceInterface.matches(Regex("[A-Za-z0-9_.-]{1,64}"))) {
+            "Router did not report a usable network interface for this client"
+        }
+        val requiredMethods = setOf("get", "add", "delete", "order", "changes", "revert", "apply", "confirm", "rollback")
+        val missing = requiredMethods.filterNot { capabilities.supports("uci", it) }
+        if (!capabilities.detected || missing.isNotEmpty()) {
+            throw AccessControlNotSupportedException(
+                if (!capabilities.detected) {
+                    "Router capabilities could not be detected; internet access control is unavailable."
+                } else {
+                    "Router does not advertise required UCI methods: ${missing.joinToString()}."
+                },
+            )
+        }
+
+        val pending = rpc.call(sessionToken, "uci", "changes", JSONObject().put("config", "firewall"))
+        val changes = pending.optJSONArray("changes")
+        if (changes != null && changes.length() > 0) {
+            throw AccessControlNotSupportedException(
+                "This router session already has pending firewall edits. Reconnect before changing device access.",
+            )
+        }
+
+        val configuration = rpc.call(sessionToken, "uci", "get", JSONObject().put("config", "firewall"))
+        val sections = configuration.optJSONObject("values")
+            ?: throw AccessControlNotSupportedException("Router did not return a readable firewall configuration.")
+        val parsed = sections.toSectionList()
+        val zones = parsed.filter { it.stringOrNull(".type") == "zone" }
+        val forwards = parsed.filter { it.stringOrNull(".type") == "forwarding" }
+        val sourceZones = zones.filter { it.hasNetwork(sourceInterface) }
+        val sourceZone = sourceZones.singleOrNull()?.stringOrNull("name")
+        val hasWanZone = zones.any { it.stringOrNull("name") == "wan" && it.hasNetwork("wan") }
+        val forwardsToWan = sourceZone != null && forwards.any {
+            it.stringOrNull("src") == sourceZone && it.stringOrNull("dest") == "wan"
+        }
+        if (sourceZone.isNullOrBlank() || !hasWanZone || !forwardsToWan) {
+            throw AccessControlNotSupportedException(
+                "The client interface must map to exactly one firewall zone with forwarding to WAN. No firewall changes were made.",
+            )
+        }
+        val policy = InternetAccessPolicy.forDevice(macAddress, sourceZone)
+
+        val matching = parsed.filter { it.stringOrNull(".name") == policy.sectionName }
+        if (matching.size > 1 || (matching.isNotEmpty() && !matching.single().isOurPolicy(policy))) {
+            throw AccessControlNotSupportedException(
+                "A router firewall section conflicts with this app-owned policy name. No firewall changes were made.",
+            )
+        }
+        if (action == InternetAccessAction.RESTORE && matching.isEmpty()) {
+            throw AccessControlNotSupportedException("This device has no app-owned block rule to restore.")
+        }
+        return InternetAccessPreview(
+            policy = policy,
+            action = action,
+            existingSection = matching.isNotEmpty(),
+            firewallFingerprint = configuration.fingerprint(),
+        )
+    }
+
+    fun applyInternetAccess(preview: InternetAccessPreview): InternetAccessOperation {
+        check(!loggedOut) { "Router session is closed; reconnect to continue" }
+        val pending = rpc.call(sessionToken, "uci", "changes", JSONObject().put("config", "firewall"))
+        if ((pending.optJSONArray("changes")?.length() ?: 0) > 0) {
+            throw AccessControlNotSupportedException("Pending firewall edits were found. Reconnect before applying this change.")
+        }
+        val latest = rpc.call(sessionToken, "uci", "get", JSONObject().put("config", "firewall"))
+        if (latest.fingerprint() != preview.firewallFingerprint) {
+            throw AccessControlNotSupportedException("Router firewall settings changed after preview. Refresh and review a new preview.")
+        }
+
+        if (preview.action == InternetAccessAction.BLOCK && preview.existingSection) {
+            return InternetAccessOperation(
+                preview.action,
+                AccessControlState.APPLIED,
+                "The app-owned block policy is already present in the router configuration. Effective device internet blocking cannot be verified through this router API.",
+            )
+        }
+
+        val section = preview.policy.sectionName
+        val appSection = JSONObject()
+            .put("name", "WiFi Dashboard internet access")
+            .put("src", preview.policy.sourceZone)
+            .put("dest", preview.policy.destinationZone)
+            .put("src_mac", preview.policy.macAddress)
+            .put("proto", "all")
+            .put("enabled", "1")
+            .put("target", preview.policy.target)
+        var applyStarted = false
+        try {
+            if (preview.action == InternetAccessAction.BLOCK && !preview.existingSection) {
+                rpc.call(
+                    sessionToken,
+                    "uci",
+                    "add",
+                    JSONObject()
+                        .put("config", "firewall")
+                        .put("type", "rule")
+                        .put("name", section)
+                        .put("values", appSection),
+                )
+                // Move only the app-owned rule ahead of broad allow rules. Other sections keep their relative order.
+                rpc.call(
+                    sessionToken,
+                    "uci",
+                    "order",
+                    JSONObject().put("config", "firewall").put("sections", JSONArray().put(section)),
+                )
+            } else if (preview.action == InternetAccessAction.RESTORE) {
+                rpc.call(
+                    sessionToken,
+                    "uci",
+                    "delete",
+                    JSONObject().put("config", "firewall").put("section", section),
+                )
+            }
+
+            rpc.call(
+                sessionToken,
+                "uci",
+                "apply",
+                JSONObject()
+                    .put("rollback", true)
+                    .put("timeout", APPLY_ROLLBACK_TIMEOUT_SECONDS)
+                    .put("ubus_rpc_session", sessionToken),
+            )
+            applyStarted = true
+            val afterApply = rpc.call(sessionToken, "uci", "get", JSONObject().put("config", "firewall"))
+            val appliedSection = afterApply.optJSONObject("values")?.toSectionList()
+                ?.singleOrNull { it.stringOrNull(".name") == section }
+            val verifiedInConfig = if (preview.action == InternetAccessAction.BLOCK) {
+                appliedSection?.isOurPolicy(preview.policy) == true
+            } else {
+                appliedSection == null
+            }
+            if (!verifiedInConfig) {
+                rpc.call(sessionToken, "uci", "rollback", JSONObject().put("ubus_rpc_session", sessionToken))
+                return InternetAccessOperation(
+                    preview.action,
+                    AccessControlState.ROLLED_BACK,
+                    "Router configuration did not match the requested policy; the router rollback was requested.",
+                )
+            }
+
+            rpc.call(sessionToken, "uci", "confirm", JSONObject().put("ubus_rpc_session", sessionToken))
+            return InternetAccessOperation(
+                preview.action,
+                AccessControlState.APPLIED,
+                "Router accepted the ${preview.action.name.lowercase()} policy. Effective device internet blocking cannot be verified through this router API.",
+            )
+        } catch (error: IOException) {
+            runCatching {
+                if (applyStarted) {
+                    rpc.call(sessionToken, "uci", "rollback", JSONObject().put("ubus_rpc_session", sessionToken))
+                } else {
+                    rpc.call(sessionToken, "uci", "revert", JSONObject().put("config", "firewall"))
+                }
+            }
+            throw error
+        }
+    }
+
     fun logout() {
         if (loggedOut) return
         rpc.call(
@@ -127,6 +295,37 @@ class OpenWrtRouterSession internal constructor(
             }
 }
 
+class AccessControlNotSupportedException(message: String) : IOException(message)
+
+private const val APPLY_ROLLBACK_TIMEOUT_SECONDS = 45
+
+private fun JSONObject.toSectionList(): List<JSONObject> {
+    val keys = keys()
+    return buildList {
+        while (keys.hasNext()) optJSONObject(keys.next())?.let(::add)
+    }
+}
+
+private fun JSONObject.hasNetwork(network: String): Boolean = when (val value = opt("network")) {
+    is JSONArray -> (0 until value.length()).any { value.optString(it) == network }
+    is String -> value.split(Regex("\\s+")).contains(network)
+    else -> false
+}
+
+private fun JSONObject.isOurPolicy(policy: InternetAccessPolicy): Boolean =
+    stringOrNull(".type") == "rule" &&
+        stringOrNull("name") == "WiFi Dashboard internet access" &&
+        stringOrNull("src") == policy.sourceZone &&
+        stringOrNull("dest") == policy.destinationZone &&
+        stringOrNull("src_mac")?.lowercase() == policy.macAddress &&
+        stringOrNull("proto") == "all" &&
+        stringOrNull("enabled").let { it == null || it == "1" } &&
+        stringOrNull("target") == policy.target
+
+private fun JSONObject.fingerprint(): String = MessageDigest.getInstance("SHA-256")
+    .digest(toString().toByteArray(Charsets.UTF_8))
+    .joinToString("") { "%02x".format(it) }
+
 private fun JSONObject.interfaces(): List<RouterInterface> =
     optJSONArray("interface")
         ?.jsonObjects()
@@ -149,24 +348,29 @@ private fun JSONObject.interfaces(): List<RouterInterface> =
             )
         }
 
-private fun JSONObject.dhcpClients(): List<RouterClient> =
-    optJSONArray("device")
-        ?.jsonObjects()
-        .orEmpty()
-        .flatMap { device ->
-            device.optJSONArray("leases")
-                ?.jsonObjects()
-                .orEmpty()
-                .map { lease ->
+private fun JSONObject.dhcpClients(): List<RouterClient> {
+    val devices = optJSONObject("device") ?: return emptyList()
+    val names = devices.keys()
+    return buildList {
+        while (names.hasNext()) {
+            val networkInterface = names.next()
+            val iface = devices.optJSONObject(networkInterface) ?: continue
+            iface.optJSONArray("leases")?.jsonObjects().orEmpty().forEach { lease ->
+                val valid = lease.signedLongOrNull("valid") ?: lease.signedLongOrNull("expires")
+                add(
                     RouterClient(
-                        macAddress = lease.stringOrNull("macaddr"),
-                        ipAddress = lease.stringOrNull("ipaddr"),
+                        macAddress = lease.stringOrNull("mac") ?: lease.stringOrNull("macaddr"),
+                        ipAddress = lease.stringOrNull("address") ?: lease.stringOrNull("ipaddr"),
                         hostname = lease.stringOrNull("hostname"),
                         source = "OpenWrt DHCP lease",
-                        details = lease.longOrNull("expires")?.let { "Lease expires in $it seconds" },
-                    )
-                }
+                        details = valid?.let { if (it < 0) "Lease does not expire" else "Lease valid for $it seconds" },
+                        networkInterface = networkInterface,
+                    ),
+                )
+            }
         }
+    }
+}
 
 private fun JSONObject.clientDetails(): String? {
     val details = buildList {
