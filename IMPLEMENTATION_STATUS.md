@@ -20,4 +20,4 @@ LAN discovery, Room inventory, hostname/history tracking, router login or OpenWr
 
 ## Validation caveat
 
-The development environment initially had no Android SDK configured and no physical Android device attached. Build and CI results must be recorded in [TEST_REPORT.md](TEST_REPORT.md) after execution; local code review does not substitute for hardware validation.
+The development environment initially had no Android SDK configured; the SDK was installed and the local build results are recorded in [TEST_REPORT.md](TEST_REPORT.md). GitHub Actions has not run because the push was rejected without GitHub credentials. No physical Android device or supported OpenWrt router is attached, so hardware and router validation remain pending.
