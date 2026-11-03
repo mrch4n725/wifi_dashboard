@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.0 — 2026-11-03
 
 - Added capability-gated, previewed OpenWrt per-device internet block/restore via app-owned firewall rules and UCI timed apply/rollback.
 - Parse interface-keyed OpenWrt DHCP leases and require an unambiguous client-interface-to-firewall-zone mapping with WAN forwarding before offering controls.
