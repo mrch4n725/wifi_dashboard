@@ -66,8 +66,77 @@ interface DeviceDao {
     @Insert
     suspend fun insertObservation(observation: DeviceObservationEntity)
 
-    @Query("UPDATE devices SET lastSeenAt = MAX(lastSeenAt, :observedAt) WHERE identityKey = :deviceId")
-    suspend fun updateLastSeen(deviceId: String, observedAt: Long)
+    @Query(
+        """
+        SELECT DISTINCT d.identityKey
+        FROM devices d
+        JOIN device_observations o ON o.deviceId = d.identityKey
+        WHERE d.identityConfidence >= 0.9
+          AND d.lastSeenAt BETWEEN :fromAt AND :toAt
+          AND o.observedAt BETWEEN :fromAt AND :toAt
+          AND (
+            (:ipAddress IS NOT NULL AND o.ipAddress = :ipAddress)
+            OR (:hostname IS NOT NULL AND o.hostname = :hostname)
+          )
+        ORDER BY d.lastSeenAt DESC
+        """,
+    )
+    suspend fun findRecentStrongIdentity(
+        ipAddress: String?,
+        hostname: String?,
+        fromAt: Long,
+        toAt: Long,
+    ): List<String>
+
+    @Query(
+        """
+        SELECT DISTINCT d.identityKey
+        FROM devices d
+        JOIN device_observations o ON o.deviceId = d.identityKey
+        WHERE d.identityConfidence < 0.9
+          AND d.lastSeenAt BETWEEN :fromAt AND :toAt
+          AND o.observedAt BETWEEN :fromAt AND :toAt
+          AND (
+            (:ipAddress IS NOT NULL AND o.ipAddress = :ipAddress)
+            OR (:hostname IS NOT NULL AND o.hostname = :hostname)
+          )
+        ORDER BY d.lastSeenAt DESC
+        """,
+    )
+    suspend fun findRecentWeakIdentities(
+        ipAddress: String?,
+        hostname: String?,
+        fromAt: Long,
+        toAt: Long,
+    ): List<String>
+
+    @Query(
+        """
+        UPDATE devices
+        SET lastSeenAt = MAX(lastSeenAt, :observedAt),
+            identityConfidence = MAX(identityConfidence, :identityConfidence)
+        WHERE identityKey = :deviceId
+        """,
+    )
+    suspend fun updateLastSeen(deviceId: String, observedAt: Long, identityConfidence: Float)
+
+    @Query(
+        """
+        UPDATE devices
+        SET firstSeenAt = MIN(firstSeenAt, (SELECT firstSeenAt FROM devices WHERE identityKey = :fromId)),
+            lastSeenAt = MAX(lastSeenAt, (SELECT lastSeenAt FROM devices WHERE identityKey = :fromId)),
+            customName = COALESCE(customName, (SELECT customName FROM devices WHERE identityKey = :fromId)),
+            groupName = COALESCE(groupName, (SELECT groupName FROM devices WHERE identityKey = :fromId))
+        WHERE identityKey = :toId
+        """,
+    )
+    suspend fun mergeDeviceMetadata(fromId: String, toId: String)
+
+    @Query("UPDATE device_observations SET deviceId = :toId WHERE deviceId = :fromId")
+    suspend fun moveObservations(fromId: String, toId: String)
+
+    @Query("DELETE FROM devices WHERE identityKey = :deviceId")
+    suspend fun deleteDevice(deviceId: String)
 
     @Query("UPDATE devices SET customName = :name WHERE identityKey = :deviceId")
     suspend fun updateName(deviceId: String, name: String?)

@@ -89,4 +89,191 @@ class DeviceRepositoryTest {
             database.close()
         }
     }
+
+    @Test
+    fun mergesRecentIpOnlyAndMacObservationsWithoutCreatingDuplicateDevices() = runBlocking {
+        val database = Room.inMemoryDatabaseBuilder(
+            ApplicationProvider.getApplicationContext<Context>(),
+            NetworkDatabase::class.java,
+        ).allowMainThreadQueries().build()
+
+        try {
+            val repository = DeviceRepository(database)
+            repository.record(
+                DeviceObservation(
+                    source = "Active TCP scan",
+                    observedAt = 10_000L,
+                    ipAddress = "192.168.1.40",
+                    serviceName = "80/HTTP",
+                ),
+            )
+            repository.updateName("ip:192.168.1.40", "Office printer")
+            repository.updateGroup("ip:192.168.1.40", "Office")
+            val recordedIdentity = repository.record(
+                DeviceObservation(
+                    source = "Android neighbor table",
+                    observedAt = 11_000L,
+                    ipAddress = "192.168.1.40",
+                    macAddress = "aa:bb:cc:dd:ee:40",
+                ),
+            )
+
+            assertEquals("mac:aa:bb:cc:dd:ee:40", recordedIdentity)
+            val devices = repository.observeDevices().first()
+            val history = repository.observeHistory("mac:aa:bb:cc:dd:ee:40").first()
+
+            assertEquals(1, devices.size)
+            assertEquals("mac:aa:bb:cc:dd:ee:40", devices.single().id)
+            assertEquals("Office printer", devices.single().customName)
+            assertEquals("Office", devices.single().groupName)
+            assertEquals(2, history.size)
+        } finally {
+            database.close()
+        }
+    }
+
+    @Test
+    fun mergesUnambiguousRecentWeakIdentitiesWithTheSameIp() = runBlocking {
+        val database = Room.inMemoryDatabaseBuilder(
+            ApplicationProvider.getApplicationContext<Context>(),
+            NetworkDatabase::class.java,
+        ).allowMainThreadQueries().build()
+
+        try {
+            val repository = DeviceRepository(database)
+            repository.record(
+                DeviceObservation(
+                    source = "mDNS",
+                    observedAt = 40_000L,
+                    ipAddress = "192.168.1.44",
+                    hostname = "printer.local",
+                ),
+            )
+            val identityKey = repository.record(
+                DeviceObservation(
+                    source = "Active TCP scan",
+                    observedAt = 41_000L,
+                    ipAddress = "192.168.1.44",
+                ),
+            )
+
+            assertEquals("host:printer.local", identityKey)
+            assertEquals(1, repository.observeDevices().first().size)
+            assertEquals(2, repository.observeHistory(identityKey).first().size)
+        } finally {
+            database.close()
+        }
+    }
+
+    @Test
+    fun mergesMaclessObservationIntoOneUnambiguousRecentMacIdentity() = runBlocking {
+        val database = Room.inMemoryDatabaseBuilder(
+            ApplicationProvider.getApplicationContext<Context>(),
+            NetworkDatabase::class.java,
+        ).allowMainThreadQueries().build()
+
+        try {
+            val repository = DeviceRepository(database)
+            repository.record(
+                DeviceObservation(
+                    source = "Android neighbor table",
+                    observedAt = 20_000L,
+                    ipAddress = "192.168.1.41",
+                    macAddress = "aa:bb:cc:dd:ee:41",
+                ),
+            )
+            val identityKey = repository.record(
+                DeviceObservation(
+                    source = "SSDP/UPnP",
+                    observedAt = 21_000L,
+                    ipAddress = "192.168.1.41",
+                    serviceName = "Sky Q (SSDP/UPnP)",
+                ),
+            )
+
+            assertEquals("mac:aa:bb:cc:dd:ee:41", identityKey)
+            assertEquals(1, repository.observeDevices().first().size)
+            assertEquals(2, repository.observeHistory(identityKey).first().size)
+        } finally {
+            database.close()
+        }
+    }
+
+    @Test
+    fun keepsAmbiguousMaclessObservationSeparate() = runBlocking {
+        val database = Room.inMemoryDatabaseBuilder(
+            ApplicationProvider.getApplicationContext<Context>(),
+            NetworkDatabase::class.java,
+        ).allowMainThreadQueries().build()
+
+        try {
+            val repository = DeviceRepository(database)
+            repository.record(
+                DeviceObservation(
+                    source = "router",
+                    observedAt = 30_000L,
+                    ipAddress = "192.168.1.42",
+                    macAddress = "aa:bb:cc:dd:ee:42",
+                ),
+            )
+            repository.record(
+                DeviceObservation(
+                    source = "router",
+                    observedAt = 30_500L,
+                    ipAddress = "192.168.1.42",
+                    macAddress = "aa:bb:cc:dd:ee:43",
+                ),
+            )
+            repository.record(
+                DeviceObservation(
+                    source = "SSDP/UPnP",
+                    observedAt = 31_000L,
+                    ipAddress = "192.168.1.42",
+                ),
+            )
+
+            assertEquals(3, repository.observeDevices().first().size)
+        } finally {
+            database.close()
+        }
+    }
+
+    @Test
+    fun doesNotMergeAnOldReusedIpFromHistoricalObservation() = runBlocking {
+        val database = Room.inMemoryDatabaseBuilder(
+            ApplicationProvider.getApplicationContext<Context>(),
+            NetworkDatabase::class.java,
+        ).allowMainThreadQueries().build()
+
+        try {
+            val repository = DeviceRepository(database)
+            repository.record(
+                DeviceObservation(
+                    source = "router",
+                    observedAt = 1_000L,
+                    ipAddress = "192.168.1.45",
+                    macAddress = "aa:bb:cc:dd:ee:45",
+                ),
+            )
+            repository.record(
+                DeviceObservation(
+                    source = "router",
+                    observedAt = 300_000L,
+                    ipAddress = "192.168.1.46",
+                    macAddress = "aa:bb:cc:dd:ee:45",
+                ),
+            )
+            repository.record(
+                DeviceObservation(
+                    source = "Active TCP scan",
+                    observedAt = 301_000L,
+                    ipAddress = "192.168.1.45",
+                ),
+            )
+
+            assertEquals(2, repository.observeDevices().first().size)
+        } finally {
+            database.close()
+        }
+    }
 }

@@ -1,35 +1,28 @@
 # Test report
 
-## Milestones 1–4
+## v0.4.0 combined-tree validation
 
-- Ran `./gradlew --no-daemon --max-workers=1 testDebugUnitTest lintDebug assembleDebug` successfully with JDK 17 and Android SDK 36.
-- **Unit tests:** 21 passed, 0 failures, 0 errors, 0 skipped. Coverage includes Wi-Fi formatting, identity and neighbor parsing, Room persistence/migration, OpenWrt RPC and DHCP lease parsing, and internet access policy transactions.
-- **Android lint:** passed with seven dependency-version advisories and no reported errors.
-- **Debug APK:** assembled at `app/build/outputs/apk/debug/app-debug.apk` (package `com.wifidashboard`; version `0.2.0` / code 2; min SDK 26, target SDK 36; 17,928,716 bytes). This is a debug build, not production-signed.
-- **SHA-256:** `e14ddd4474dc3c8ad2023882ddf8516e255ef508d1d3e7bd5407dd1deaf9feea`
-- **GitHub Actions:** configured to run tests, lint, assemble the APK, and upload it as a workflow artifact on pushes and tags. The v0.2.0 tag build is pending.
-- **Physical-device/LAN/router validation:** pending; no Android device or OpenWrt router is available in the current workspace. Android discovery behavior and real rpcd response compatibility are therefore not hardware-verified. Protocol tests use representative mocked JSON-RPC responses.
+Command:
 
-CI also validates APK existence, calculates a checksum, and publishes the APK artifact. A successful build does not replace checking permission behavior and reported values on representative Android versions.
+```text
+./gradlew --no-daemon --max-workers=1 --stacktrace --warning-mode all testDebugUnitTest lintDebug assembleDebug
+```
 
-## Milestone 4 — transactional device internet access controls
+Environment: OpenJDK 21.0.13, Android SDK 36, Gradle wrapper 8.14.6.
 
-- Added focused unit coverage for stable app-owned policy identity, invalid MAC rejection, supported OpenWrt UCI transaction ordering, and unsupported firewall layouts; added Room audit-event persistence coverage.
-- Final verification after DHCP interface parsing and interface-to-firewall-zone mapping changes: `testDebugUnitTest`, `lintDebug`, and `assembleDebug` all succeeded.
-- **Unit tests:** 21 passed, 0 failures, 0 errors, 0 skipped.
-- **Android lint:** passed with seven dependency-version advisory warnings and no lint errors.
-- **Debug APK:** `app/build/outputs/apk/debug/app-debug.apk`.
-- **SHA-256:** `e14ddd4474dc3c8ad2023882ddf8516e255ef508d1d3e7bd5407dd1deaf9feea`.
-- For this run, JDK 17 and Android Build Tools 35.0.0/platform 36 were installed in the workspace SDK after SDK license acceptance. Robolectric required `-Duser.home=/home/osama/Documents/Codex` because the default home directory is read-only.
-- DHCP leases use the router's interface-keyed `dhcp.ipv4leases` response; access control requires the reported interface to resolve to exactly one firewall zone with WAN forwarding. The operation verifies the saved UCI rule only; it cannot verify the selected device's actual internet connectivity.
-- **Router validation:** pending. No physical OpenWrt router is attached.
+- **Unit tests:** 42 passed, 0 failures, 0 errors, 0 skipped across 12 test suites.
+- **Android lint:** passed; seven existing dependency-version advisories, no lint errors.
+- **Debug APK:** assembled at `app/build/outputs/apk/debug/app-debug.apk`; package `com.wifidashboard`, versionCode `4`, versionName `0.4.0`, min SDK 26, target SDK 36; 18,146,244 bytes.
+- **SHA-256:** `5d9d925464adf663b8456547dff2c60b0bc6f3b19220a7932821d3d29023f7da`
+- Tests include private-subnet bounds, TCP connect probing against a local test socket, mDNS observation parsing, SSDP/Sky Q header parsing, scan-settings persistence, identity merging/ambiguity, existing OpenWrt transaction behavior, Room audit persistence, and database migration.
+- These are unit/protocol tests. No physical Android device, Sky Q box, home LAN, or supported router was available. Real discovery coverage, multicast/permission behavior, comparison against the router's client list, and router packet-level enforcement remain unverified.
 
-## Milestone 5 — initial wireless configuration slice
+Validation used OpenJDK 21.0.13 because the workspace default JDK 25 is not supported by the bundled Kotlin compiler. Android SDK command-line tooling emitted a non-fatal notice that it supports SDK XML through version 3 while the installed SDK contains version 4.
 
-- Added OpenWrt wireless section discovery and a transactional SSID rename flow, with protocol tests for inspection, read-back confirmation, and rollback.
-- **Unit tests:** `testDebugUnitTest` passed; 26 tests, 0 failures, 0 errors, 0 skipped.
-- **Android lint:** `lintDebug` passed.
-- **APK assembly:** `assembleDebug` passed using JDK 21 and Android SDK 36 installed under `/tmp`.
-- **Debug APK:** `app/build/outputs/apk/debug/app-debug.apk` (version `0.3.0`, code 3; 18 MB).
-- **SHA-256:** `c788073d4dfcf68d7694720fda4134d42cc92522bc9caa86551773b910278257`.
-- **Physical router validation:** pending. No OpenWrt router is attached, and the change can interrupt wireless clients.
+## Existing CI context
+
+- GitHub Actions run [41475828296](https://github.com/mrch4n725/wifi_dashboard/actions/runs/41475828296) for commit `3b9bb44` failed before Gradle ran because `android-actions/setup-android@v3` attempted to install the retired `tools` SDK package.
+- The repair already present in the checkout is committed locally in `bd6788b` and `a7979a5`: current Node-compatible actions, `setup-android@v4` requesting `platform-tools`, Ubuntu 24.04, failure report artifacts, APK ZIP validation, and an application-ID check.
+- A prior `git push origin main` failed because GitHub credentials were unavailable. The repaired workflow has not been verified by a remote Actions run. No push was attempted for this development branch.
+
+A passing local build does not replace checking discovery results and permissions on supported Android versions or checking router-reported/enforced behavior against actual hardware.

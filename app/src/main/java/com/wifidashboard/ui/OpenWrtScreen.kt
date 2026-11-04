@@ -65,14 +65,15 @@ import org.json.JSONException
 @Composable
 fun OpenWrtScreen(
     repository: DeviceRepository,
+    defaultGateway: String?,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val adapter = remember { OpenWrtAdapter() }
     val credentialStore = remember(context) { RouterCredentialStore(context) }
     val scope = rememberCoroutineScope()
-    var endpointText by remember { mutableStateOf("https://192.168.1.1") }
-    var username by remember { mutableStateOf("root") }
+    var endpointText by remember { mutableStateOf("") }
+    var username by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var allowCleartext by remember { mutableStateOf(false) }
     var rememberCredentials by remember { mutableStateOf(false) }
@@ -121,6 +122,12 @@ fun OpenWrtScreen(
         }
     }
 
+    androidx.compose.runtime.LaunchedEffect(defaultGateway) {
+        if (endpointText.isBlank() && defaultGateway != null) {
+            endpointText = "https://$defaultGateway"
+        }
+    }
+
     fun requestWirelessPreview(network: RouterWirelessNetwork) {
         val activeSession = session ?: run {
             message = "Connect to the router before changing wireless settings."
@@ -156,13 +163,13 @@ fun OpenWrtScreen(
         verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
         Text(
-            "OPENWRT ROUTER",
+            "ROUTER API",
             style = MaterialTheme.typography.labelLarge,
             color = MaterialTheme.colorScheme.primary,
             fontWeight = FontWeight.Bold,
         )
         Text(
-            "Connect directly to rpcd on your local network. Only methods advertised by this router are queried.",
+            "OpenWrt rpcd/ubus is the first supported router API provider. A discovered gateway does not imply that it exposes this API; authentication, API availability, and administrative permissions are checked separately.",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -171,7 +178,15 @@ fun OpenWrtScreen(
             onValueChange = { endpointText = it },
             modifier = Modifier.fillMaxWidth(),
             label = { Text("Router URL") },
-            supportingText = { Text("Origin only, for example https://192.168.1.1") },
+            supportingText = {
+                Text(
+                    if (defaultGateway == null) {
+                        "Origin only; Android has not exposed an IPv4 default gateway."
+                    } else {
+                        "Origin only; detected gateway is $defaultGateway."
+                    },
+                )
+            },
             singleLine = true,
             enabled = !busy && session == null,
         )
@@ -179,7 +194,7 @@ fun OpenWrtScreen(
             value = username,
             onValueChange = { username = it },
             modifier = Modifier.fillMaxWidth(),
-            label = { Text("Username") },
+            label = { Text("Router API username") },
             singleLine = true,
             enabled = !busy && session == null,
         )

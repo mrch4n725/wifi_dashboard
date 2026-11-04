@@ -39,6 +39,7 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -62,9 +63,14 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import android.content.pm.PackageManager
+import android.net.ConnectivityManager
 import com.wifidashboard.discovery.DiscoveryEvent
+import com.wifidashboard.discovery.ActiveTcpScanner
+import com.wifidashboard.discovery.DiscoverySettingsStore
+import com.wifidashboard.discovery.IPv4Subnet
 import com.wifidashboard.discovery.MdnsDiscovery
 import com.wifidashboard.discovery.NeighborTableReader
+import com.wifidashboard.discovery.SsdpDiscovery
 import com.wifidashboard.network.AndroidNetworkInspector
 import com.wifidashboard.network.NetworkSnapshot
 import com.wifidashboard.storage.DeviceListItem
@@ -78,6 +84,7 @@ import java.text.DateFormat
 import java.util.Date
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -98,6 +105,7 @@ fun WifiDashboardApp() {
     val deviceRepository = remember(context) {
         DeviceRepository(NetworkDatabase.get(context))
     }
+    val discoverySettingsStore = remember(context) { DiscoverySettingsStore(context) }
     var snapshot by remember { mutableStateOf<NetworkSnapshot?>(null) }
     var destination by remember { mutableStateOf(Destination.Dashboard) }
     var permissionGranted by remember(context) {
@@ -203,6 +211,7 @@ fun WifiDashboardApp() {
             )
             Destination.Router -> OpenWrtScreen(
                 repository = deviceRepository,
+                defaultGateway = snapshot?.gateways?.firstOrNull(::isIpv4Literal),
                 modifier = Modifier.padding(padding),
             )
             Destination.Settings -> SettingsScreen(
@@ -210,6 +219,8 @@ fun WifiDashboardApp() {
                 onRequestPermission = {
                     permissionLauncher.launch(requiredWifiPermissions())
                 },
+                discoverySettingsStore = discoverySettingsStore,
+                snapshot = snapshot,
                 modifier = Modifier.padding(padding),
             )
         }
@@ -228,10 +239,14 @@ private fun DevicesScreen(
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val mdns = remember(context) { MdnsDiscovery(context) }
+    val ssdp = remember(context) { SsdpDiscovery(context) }
+    val activeScanner = remember { ActiveTcpScanner() }
     val neighborReader = remember { NeighborTableReader() }
+    val discoverySettingsStore = remember(context) { DiscoverySettingsStore(context) }
     var selectedDeviceId by remember { mutableStateOf<String?>(null) }
     var isScanning by remember { mutableStateOf(false) }
     var scanMessage by remember { mutableStateOf<String?>(null) }
+    var scanJob by remember { mutableStateOf<Job?>(null) }
 
     val selectedDevice = devices.firstOrNull { it.id == selectedDeviceId }
     if (selectedDevice != null) {
@@ -258,6 +273,11 @@ private fun DevicesScreen(
         item {
             Button(
                 onClick = {
+                    if (isScanning) {
+                        scanJob?.cancel()
+                        scanMessage = "Cancelling discovery…"
+                        return@Button
+                    }
                     if (!permissionGranted) {
                         onRequestPermission()
                         return@Button
@@ -266,15 +286,68 @@ private fun DevicesScreen(
                         scanMessage = "Connect to a local Wi-Fi or Ethernet network before discovering devices."
                         return@Button
                     }
-                    scope.launch {
+                    val activeSnapshot = snapshot
+                    val connectivityManager = context.getSystemService(ConnectivityManager::class.java)
+                    val scanNetwork = connectivityManager.activeNetwork
+                    val scanLinkProperties = scanNetwork?.let(connectivityManager::getLinkProperties)
+                    val scanNetworkMatchesSnapshot = activeSnapshot != null &&
+                        scanLinkProperties != null &&
+                        (
+                            activeSnapshot.interfaceName.isNullOrBlank() ||
+                                scanLinkProperties.interfaceName == activeSnapshot.interfaceName
+                            ) &&
+                        activeSnapshot.ipv4Addresses.any { address ->
+                            scanLinkProperties.linkAddresses.any { it.address.hostAddress == address }
+                        }
+                    val scanSocketFactory = scanNetwork
+                        ?.takeIf { scanNetworkMatchesSnapshot }
+                        ?.socketFactory
+                    scanJob = scope.launch {
                         isScanning = true
-                        scanMessage = "Reading cached neighbors and browsing mDNS services for up to 12 seconds…"
+                        scanMessage = "Reading router, neighbor, active TCP, mDNS, and SSDP sources…"
                         var recorded = 0
+                        var activeHostsFound = 0
                         val warnings = mutableSetOf<String>()
                         try {
+                            val settings = discoverySettingsStore.load()
+                            val localAddress = activeSnapshot?.ipv4Addresses?.firstOrNull()
+                            val cidr = settings.selectedSubnetCidr
+                                ?: activeSnapshot?.prefixes?.firstOrNull {
+                                    it.substringBefore('/') == localAddress
+                                }
+                            val subnet = if (localAddress != null && cidr != null) {
+                                try {
+                                    IPv4Subnet.forLocalAddress(cidr, localAddress)
+                                } catch (error: IllegalArgumentException) {
+                                    warnings += error.message ?: "The active IPv4 subnet is not eligible for scanning."
+                                    null
+                                }
+                            } else {
+                                warnings += "Android did not expose a local IPv4 subnet; active IPv4 scanning is unavailable."
+                                null
+                            }
+
+                            suspend fun consume(event: DiscoveryEvent) {
+                                when (event) {
+                                    is DiscoveryEvent.Found -> {
+                                        repository.record(event.observation)
+                                        recorded++
+                                        if (event.observation.source == ActiveTcpScanner.SOURCE) {
+                                            activeHostsFound++
+                                        }
+                                    }
+                                    is DiscoveryEvent.Warning -> warnings += event.message
+                                    is DiscoveryEvent.Progress -> {
+                                        scanMessage =
+                                            "Active TCP scan: ${event.completed}/${event.total} hosts checked; " +
+                                                "$activeHostsFound hosts found. Tap to cancel."
+                                    }
+                                }
+                            }
+
                             val neighbors = try {
                                 withContext(Dispatchers.IO) {
-                                    neighborReader.read(interfaceName = snapshot?.interfaceName)
+                                    neighborReader.read(interfaceName = activeSnapshot?.interfaceName)
                                 }
                             } catch (error: IOException) {
                                 warnings += "Android's cached neighbor table is unavailable: ${error.message}"
@@ -284,27 +357,42 @@ private fun DevicesScreen(
                                 repository.record(observation)
                                 recorded++
                             }
-                            mdns.scan().collect { event ->
-                                when (event) {
-                                    is DiscoveryEvent.Found -> {
-                                        val observation = event.observation
-                                        if (
-                                            observation.macAddress == null &&
-                                            observation.hostname == null &&
-                                            observation.ipAddress == null
-                                        ) {
-                                            warnings +=
-                                                "An mDNS service without a usable host identity was not added to inventory."
-                                        } else {
-                                            repository.record(observation)
-                                            recorded++
-                                        }
+
+                            if (subnet != null && scanSocketFactory != null) {
+                                activeScanner.scan(
+                                    subnet = subnet,
+                                    concurrency = settings.concurrency,
+                                    connectTimeoutMillis = settings.connectTimeoutMillis,
+                                    maxDurationMillis = settings.maxDurationMillis,
+                                    socketFactory = scanSocketFactory,
+                                ).collect(::consume)
+
+                                val refreshedNeighbors = try {
+                                    withContext(Dispatchers.IO) {
+                                        neighborReader.read(interfaceName = activeSnapshot?.interfaceName)
                                     }
-                                    is DiscoveryEvent.Warning -> warnings += event.message
+                                } catch (error: IOException) {
+                                    warnings += "Android's neighbor table could not be reread after active discovery: ${error.message}"
+                                    emptyList()
+                                }
+                                refreshedNeighbors.forEach { observation ->
+                                    repository.record(observation)
+                                    recorded++
+                                }
+                            } else if (subnet != null) {
+                                warnings += "The selected Android network is no longer active; active TCP and SSDP discovery were skipped."
+                            }
+                            mdns.scan().collect(::consume)
+                            if (subnet != null && scanSocketFactory != null) {
+                                try {
+                                    ssdp.scan(subnet, activeSnapshot?.interfaceName).collect(::consume)
+                                } catch (error: IOException) {
+                                    warnings += "SSDP/UPnP discovery failed: ${error.message}"
                                 }
                             }
                             scanMessage = buildString {
-                                append("Discovery finished: $recorded observations saved.")
+                                append("Discovery finished: $recorded observations saved; ")
+                                append("$activeHostsFound hosts exposed one or more scanned TCP ports.")
                                 if (neighbors.isEmpty()) {
                                     append(" No cached neighbors were exposed by Android.")
                                 }
@@ -314,7 +402,10 @@ private fun DevicesScreen(
                                 }
                             }
                         } catch (cancelled: CancellationException) {
+                            scanMessage = "Discovery cancelled; $recorded observations already saved were retained."
                             throw cancelled
+                        } catch (error: IOException) {
+                            scanMessage = "Network discovery failed: ${error.message}"
                         } catch (error: SecurityException) {
                             scanMessage = "Android denied local network discovery: ${error.message}"
                         } catch (error: IllegalStateException) {
@@ -323,13 +414,13 @@ private fun DevicesScreen(
                             scanMessage = "Device inventory could not be saved: ${error.message}"
                         } finally {
                             isScanning = false
+                            scanJob = null
                         }
                     }
                 },
-                enabled = !isScanning,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                Text(if (isScanning) "Discovering…" else "Discover on this network")
+                Text(if (isScanning) "Cancel discovery" else "Discover on this network")
             }
         }
         if (!permissionGranted) {
@@ -351,7 +442,7 @@ private fun DevicesScreen(
         }
         item {
             Text(
-                "Read-only and intentionally conservative: reads Android's cached neighbor table and listens for selected mDNS service advertisements. No subnet sweep, ping, or port scan is performed. Results are partial, not a complete list of LAN clients.",
+                "Discovery combines cached Android neighbors, bounded TCP connects to 11 common ports on a private IPv4 subnet, selected mDNS service types, and SSDP/UPnP responses. It is cancellable and limited to 1,024 local hosts; no ICMP, raw packets, UDP port scan, or complete traffic capture is performed. Results are partial—not an authoritative client list—and service scans do not prove a port is publicly reachable.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -576,6 +667,13 @@ private fun DeviceEditDialog(
 private fun formatTimestamp(timestamp: Long): String =
     DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(timestamp))
 
+private fun isIpv4Literal(value: String): Boolean {
+    val octets = value.split('.')
+    return octets.size == 4 && octets.all { octet ->
+        octet.toIntOrNull()?.let { it in 0..255 && (octet == "0" || !octet.startsWith('0')) } == true
+    }
+}
+
 @Composable
 private fun DashboardScreen(
     snapshot: NetworkSnapshot?,
@@ -718,8 +816,25 @@ private fun WifiScreen(
 private fun SettingsScreen(
     permissionGranted: Boolean,
     onRequestPermission: () -> Unit,
+    discoverySettingsStore: DiscoverySettingsStore,
+    snapshot: NetworkSnapshot?,
     modifier: Modifier = Modifier,
 ) {
+    val initialSettings = remember(discoverySettingsStore) { discoverySettingsStore.load() }
+    var concurrency by remember(discoverySettingsStore) {
+        mutableStateOf(initialSettings.concurrency.toString())
+    }
+    var timeout by remember(discoverySettingsStore) {
+        mutableStateOf(initialSettings.connectTimeoutMillis.toString())
+    }
+    var duration by remember(discoverySettingsStore) {
+        mutableStateOf((initialSettings.maxDurationMillis / 1_000).toString())
+    }
+    var selectedSubnet by remember(discoverySettingsStore) {
+        mutableStateOf(initialSettings.selectedSubnetCidr.orEmpty())
+    }
+    var settingsMessage by remember { mutableStateOf<String?>(null) }
+
     LazyColumn(
         modifier = modifier.fillMaxSize(),
         contentPadding = PaddingValues(20.dp),
@@ -727,6 +842,72 @@ private fun SettingsScreen(
     ) {
         item {
             SectionHeading("APP SETTINGS", "Local network administration")
+        }
+        item {
+            Text("DISCOVERY SETTINGS", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.primary)
+            OutlinedTextField(
+                value = selectedSubnet,
+                onValueChange = { selectedSubnet = it },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Selected local IPv4 subnet (optional)") },
+                supportingText = { Text("CIDR, for example 192.168.1.0/24; blank uses Android's current subnet.") },
+                singleLine = true,
+            )
+            OutlinedTextField(
+                value = concurrency,
+                onValueChange = { concurrency = it.filter(Char::isDigit) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Concurrent hosts (1–64)") },
+                singleLine = true,
+            )
+            OutlinedTextField(
+                value = timeout,
+                onValueChange = { timeout = it.filter(Char::isDigit) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("TCP connect timeout in ms (100–1000)") },
+                singleLine = true,
+            )
+            OutlinedTextField(
+                value = duration,
+                onValueChange = { duration = it.filter(Char::isDigit) },
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("Active scan limit in seconds (5–60)") },
+                singleLine = true,
+            )
+            Text(
+                "A custom subnet must contain this handset's current local address. Scanning is limited to private or link-local IPv4 networks and at most 1,024 hosts; blank uses Android's current subnet.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Button(
+                onClick = {
+                    try {
+                        selectedSubnet.trim().takeIf(String::isNotEmpty)?.let { cidr ->
+                            val localAddress = snapshot?.ipv4Addresses?.firstOrNull()
+                                ?: throw IllegalArgumentException(
+                                    "Connect to the local network before selecting a subnet.",
+                                )
+                            IPv4Subnet.forLocalAddress(cidr, localAddress)
+                        }
+                        discoverySettingsStore.save(
+                            com.wifidashboard.discovery.DiscoverySettings(
+                                concurrency = concurrency.toInt(),
+                                connectTimeoutMillis = timeout.toInt(),
+                                maxDurationMillis = duration.toLong() * 1_000,
+                                selectedSubnetCidr = selectedSubnet.trim().takeIf(String::isNotEmpty),
+                            ),
+                        )
+                        settingsMessage = "Discovery settings saved and will apply to the next scan."
+                    } catch (error: IllegalArgumentException) {
+                        settingsMessage = error.message ?: "Enter valid discovery settings."
+                    } catch (error: IllegalStateException) {
+                        settingsMessage = error.message ?: "Could not save discovery settings."
+                    }
+                },
+            ) {
+                Text("Save discovery settings")
+            }
+            settingsMessage?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
         }
         item {
             DetailCard(

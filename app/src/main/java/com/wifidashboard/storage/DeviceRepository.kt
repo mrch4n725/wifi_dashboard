@@ -27,11 +27,29 @@ class DeviceRepository(private val database: NetworkDatabase) {
         val hostname = observation.hostname?.let(DeviceIdentity::normalizeHostname)
         val ipAddress = observation.ipAddress?.takeIf(String::isNotBlank)
         val observedAt = observation.observedAt
+        val matchFrom = (observedAt - IDENTITY_MATCH_WINDOW_MILLIS).coerceAtLeast(0)
+        val matchThrough = observedAt + IDENTITY_MATCH_WINDOW_MILLIS
+        var recordedIdentityKey = identityKey
 
         database.withTransaction {
+            val matchedStrongIdentities = if (identity.confidence < 0.9f) {
+                dao.findRecentStrongIdentity(ipAddress, hostname, matchFrom, matchThrough)
+            } else {
+                emptyList()
+            }
+            val matchedWeakIdentities =
+                dao.findRecentWeakIdentities(ipAddress, hostname, matchFrom, matchThrough)
+            val targetIdentityKey = when {
+                identity.confidence >= 0.9f -> identityKey
+                matchedStrongIdentities.size == 1 -> matchedStrongIdentities.single()
+                matchedStrongIdentities.isEmpty() && matchedWeakIdentities.size == 1 ->
+                    matchedWeakIdentities.single()
+                else -> identityKey
+            }
+            recordedIdentityKey = targetIdentityKey
             dao.insertDevice(
                 DeviceEntity(
-                    identityKey = identityKey,
+                    identityKey = targetIdentityKey,
                     customName = null,
                     groupName = null,
                     firstSeenAt = observedAt,
@@ -39,10 +57,25 @@ class DeviceRepository(private val database: NetworkDatabase) {
                     identityConfidence = identity.confidence,
                 ),
             )
-            dao.updateLastSeen(identityKey, observedAt)
+
+            val canConsolidateWeakIdentity =
+                identity.confidence >= 0.9f || matchedStrongIdentities.size == 1
+            if (canConsolidateWeakIdentity) {
+                if (
+                    matchedWeakIdentities.size == 1 &&
+                    matchedWeakIdentities.single() != targetIdentityKey
+                ) {
+                    val weakIdentityKey = matchedWeakIdentities.single()
+                    dao.mergeDeviceMetadata(weakIdentityKey, targetIdentityKey)
+                    dao.moveObservations(weakIdentityKey, targetIdentityKey)
+                    dao.deleteDevice(weakIdentityKey)
+                }
+            }
+
+            dao.updateLastSeen(targetIdentityKey, observedAt, identity.confidence)
             dao.insertObservation(
                 DeviceObservationEntity(
-                    deviceId = identityKey,
+                    deviceId = targetIdentityKey,
                     source = observation.source,
                     observedAt = observedAt,
                     ipAddress = ipAddress,
@@ -53,7 +86,7 @@ class DeviceRepository(private val database: NetworkDatabase) {
                 ),
             )
         }
-        return identityKey
+        return recordedIdentityKey
     }
 
     suspend fun updateName(deviceId: String, name: String?) {
@@ -62,6 +95,10 @@ class DeviceRepository(private val database: NetworkDatabase) {
 
     suspend fun updateGroup(deviceId: String, group: String?) {
         dao.updateGroup(deviceId, group?.trim()?.takeIf(String::isNotEmpty))
+    }
+
+    companion object {
+        private const val IDENTITY_MATCH_WINDOW_MILLIS = 120_000L
     }
 }
 

@@ -25,6 +25,7 @@ import java.util.concurrent.atomic.AtomicInteger
 sealed interface DiscoveryEvent {
     data class Found(val observation: DeviceObservation) : DiscoveryEvent
     data class Warning(val message: String) : DiscoveryEvent
+    data class Progress(val completed: Int, val total: Int) : DiscoveryEvent
 }
 
 class MdnsDiscovery(context: Context) {
@@ -233,21 +234,12 @@ class MdnsDiscovery(context: Context) {
     }
 
     private fun serviceObservation(service: NsdServiceInfo): DeviceObservation {
-        val addresses = serviceAddresses(service)
-        val address = addresses.firstOrNull { candidate ->
-            !candidate.isAnyLocalAddress &&
-                !candidate.isLoopbackAddress &&
-                !candidate.isMulticastAddress &&
-                (candidate !is Inet6Address || !candidate.isLinkLocalAddress)
-        }?.hostAddress
-        val port = service.port.takeIf { it > 0 }
-        return DeviceObservation(
-            source = "mDNS ${service.serviceType}",
-            observedAt = System.currentTimeMillis(),
-            ipAddress = address,
-            hostname = resolvedHostname(service),
+        return MdnsObservationParser.parse(
+            serviceType = service.serviceType,
             serviceName = service.serviceName,
-            detail = port?.let { "Advertised on port $it" },
+            addresses = serviceAddresses(service),
+            hostname = resolvedHostname(service),
+            port = service.port,
         )
     }
 
@@ -311,6 +303,32 @@ class MdnsDiscovery(context: Context) {
             "_googlecast._tcp.",
             "_smb._tcp.",
             "_ssh._tcp.",
+        )
+    }
+}
+
+internal object MdnsObservationParser {
+    fun parse(
+        serviceType: String,
+        serviceName: String,
+        addresses: List<java.net.InetAddress>,
+        hostname: String?,
+        port: Int,
+        observedAt: Long = System.currentTimeMillis(),
+    ): DeviceObservation {
+        val address = addresses.firstOrNull { candidate ->
+            !candidate.isAnyLocalAddress &&
+                !candidate.isLoopbackAddress &&
+                !candidate.isMulticastAddress &&
+                (candidate !is Inet6Address || !candidate.isLinkLocalAddress)
+        }?.hostAddress?.substringBefore('%')
+        return DeviceObservation(
+            source = "mDNS $serviceType",
+            observedAt = observedAt,
+            ipAddress = address,
+            hostname = hostname,
+            serviceName = serviceName,
+            detail = port.takeIf { it > 0 }?.let { "Advertised on port $it" },
         )
     }
 }
