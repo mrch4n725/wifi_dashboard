@@ -76,6 +76,29 @@ data class RouterInterface(
     val addresses: List<String>,
 )
 
+data class RouterWirelessNetwork(
+    val sectionName: String,
+    val mode: String?,
+    val ssid: String?,
+    val radio: String?,
+    val encryption: String?,
+    val channel: String?,
+    val disabled: Boolean,
+)
+
+data class WirelessSsidPreview(
+    val network: RouterWirelessNetwork,
+    val newSsid: String,
+    val wirelessFingerprint: String,
+)
+
+enum class WirelessConfigState { APPLIED, ROLLED_BACK }
+
+data class WirelessConfigOperation(
+    val state: WirelessConfigState,
+    val message: String,
+)
+
 data class RouterClient(
     val macAddress: String?,
     val ipAddress: String?,
@@ -90,6 +113,7 @@ data class RouterSnapshot(
     val firmware: String?,
     val uptimeSeconds: Long?,
     val interfaces: List<RouterInterface>?,
+    val wirelessNetworks: List<RouterWirelessNetwork>?,
     val dhcpLeases: List<RouterClient>,
     val wirelessClients: List<RouterClient>,
     val capabilities: RouterCapabilities,

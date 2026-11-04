@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.3.0 — 2026-11-04
+
+- Added capability-gated OpenWrt wireless settings inspection and SSID rename for supported AP sections, with explicit confirmation, UCI rollback/read-back, and local audit events.
+- Added protocol tests for wireless settings discovery, successful SSID updates, rollback after a read-back mismatch, pending UCI edits, and AP-only restrictions.
+
 ## v0.2.0 — 2026-11-03
 
 - Added capability-gated, previewed OpenWrt per-device internet block/restore via app-owned firewall rules and UCI timed apply/rollback.

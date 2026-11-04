@@ -49,9 +49,19 @@
 - Added a Room 1→2 migration for audit records. Router ACLs may deny UCI operations; custom zones and nonstandard policy layouts are unsupported and fail closed.
 - Verification: 21 unit tests passed; Android lint and debug APK assembly passed. Lint reported seven dependency-version advisories. Physical Android/OpenWrt testing remains pending.
 
+## Milestone 5 — Wireless/router configuration
+
+**Status: initial SSID management slice implemented; automated execution and real-router validation remain pending.**
+
+- Reads OpenWrt UCI wireless access-point settings when `uci.get` is advertised; displays SSID, mode, encryption, radio, channel, and disabled state without reading or displaying wireless keys.
+- Allows renaming only an enabled, router-reported AP interface. The UI requires review and explicit confirmation; the adapter validates the SSID, refuses any pre-existing UCI edits, rechecks the configuration fingerprint and AP identity, applies with a 45-second rollback window, reads the SSID back, and confirms only on an exact match.
+- Records requested and final outcomes in the local router-action audit without persisting SSID values. The saved configuration check does not verify that clients can reconnect; changing an SSID may interrupt the management connection.
+- Protocol tests cover wireless settings discovery, successful read-back/confirmation, rollback on a mismatch, pending UCI edits, and AP-only restrictions. The focused OpenWrt adapter test class and debug APK assembly passed using an isolated JDK 21 and Android SDK 36 under `/tmp`; physical OpenWrt validation remains pending.
+- Password, encryption, channel, radio, DHCP/DNS, and broader router settings remain read-only or unsupported. Physical OpenWrt validation is still required before treating this slice as verified.
+
 ## Explicitly not implemented
 
-Wi-Fi configuration, DHCP/DNS configuration, QoS, port forwarding, per-device/router traffic analytics, diagnostics, topology map, scheduling, and quarantine remain unimplemented. Internet access controls are not verified against a physical OpenWrt router or end-device traffic. Android-only discovery sources are partial and do not determine current connection status. The UI does not claim unsupported features work.
+Wi-Fi password/encryption and radio configuration, DHCP/DNS configuration, QoS, port forwarding, per-device/router traffic analytics, diagnostics, topology map, scheduling, and quarantine remain unimplemented. Internet access controls and SSID changes are not verified against a physical OpenWrt router or end-device behavior. Android-only discovery sources are partial and do not determine current connection status. The UI does not claim unsupported features work.
 
 ## Validation caveat
 

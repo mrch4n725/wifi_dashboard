@@ -59,12 +59,19 @@ class OpenWrtRouterSession internal constructor(
         val systemInfo = callIfSupported("system", "info", issues)
         val networkDump = callIfSupported("network.interface", "dump", issues)
         val leases = callIfSupported("dhcp", "ipv4leases", issues)
+        val wirelessConfig = callIfSupported(
+            "uci",
+            "get",
+            issues,
+            JSONObject().put("config", "wireless"),
+        )
 
         return RouterSnapshot(
             model = board?.stringOrNull("model") ?: board?.stringOrNull("board_name"),
             firmware = board?.optJSONObject("release")?.stringOrNull("description"),
             uptimeSeconds = systemInfo?.longOrNull("uptime"),
             interfaces = networkDump?.interfaces(),
+            wirelessNetworks = wirelessConfig?.wirelessNetworks(),
             dhcpLeases = leases?.dhcpClients().orEmpty(),
             wirelessClients = wirelessClients(issues),
             capabilities = capabilities,
@@ -239,6 +246,134 @@ class OpenWrtRouterSession internal constructor(
         }
     }
 
+    fun previewWirelessSsid(sectionName: String, newSsid: String): WirelessSsidPreview {
+        check(!loggedOut) { "Router session is closed; reconnect to continue" }
+        require(sectionName.matches(Regex("[A-Za-z0-9_.-]{1,64}"))) {
+            "Router did not report a usable wireless section"
+        }
+        validateSsid(newSsid)
+        requireWirelessConfigMethods()
+        requireNoPendingUciChanges()
+
+        val configuration = readWirelessConfiguration()
+        val network = configuration.wirelessNetworks()
+            ?.singleOrNull { it.sectionName == sectionName }
+            ?: throw WirelessConfigNotSupportedException("The selected wireless section is unavailable or ambiguous.")
+        if (network.mode != "ap") {
+            throw WirelessConfigNotSupportedException("Only router-reported access-point interfaces can be renamed.")
+        }
+        if (network.ssid.isNullOrBlank()) {
+            throw WirelessConfigNotSupportedException("The selected access point has no readable SSID.")
+        }
+        require(newSsid != network.ssid) { "Enter a different SSID" }
+        return WirelessSsidPreview(network, newSsid, configuration.fingerprint())
+    }
+
+    fun applyWirelessSsid(preview: WirelessSsidPreview): WirelessConfigOperation {
+        check(!loggedOut) { "Router session is closed; reconnect to continue" }
+        requireWirelessConfigMethods()
+        validateSsid(preview.newSsid)
+        requireNoPendingUciChanges()
+        val latestConfiguration = readWirelessConfiguration()
+        if (latestConfiguration.fingerprint() != preview.wirelessFingerprint) {
+            throw WirelessConfigNotSupportedException(
+                "Router wireless settings changed after preview. Refresh and review a new preview.",
+            )
+        }
+        val currentNetwork = latestConfiguration.wirelessNetworks()
+            ?.singleOrNull { it.sectionName == preview.network.sectionName }
+        if (currentNetwork?.mode != "ap" || currentNetwork != preview.network) {
+            throw WirelessConfigNotSupportedException(
+                "The preview does not match the selected access point. Refresh and review a new preview.",
+            )
+        }
+
+        var applyStarted = false
+        try {
+            rpc.call(
+                sessionToken,
+                "uci",
+                "set",
+                JSONObject()
+                    .put("config", "wireless")
+                    .put("section", preview.network.sectionName)
+                    .put("values", JSONObject().put("ssid", preview.newSsid)),
+            )
+            rpc.call(
+                sessionToken,
+                "uci",
+                "apply",
+                JSONObject()
+                    .put("rollback", true)
+                    .put("timeout", APPLY_ROLLBACK_TIMEOUT_SECONDS)
+                    .put("ubus_rpc_session", sessionToken),
+            )
+            applyStarted = true
+            val savedNetwork = readWirelessConfiguration().wirelessNetworks()
+                ?.singleOrNull { it.sectionName == preview.network.sectionName }
+            if (savedNetwork?.ssid != preview.newSsid) {
+                rpc.call(sessionToken, "uci", "rollback", JSONObject().put("ubus_rpc_session", sessionToken))
+                return WirelessConfigOperation(
+                    WirelessConfigState.ROLLED_BACK,
+                    "Router wireless configuration did not match the requested SSID; rollback was requested.",
+                )
+            }
+
+            rpc.call(sessionToken, "uci", "confirm", JSONObject().put("ubus_rpc_session", sessionToken))
+            return WirelessConfigOperation(
+                WirelessConfigState.APPLIED,
+                "Router accepted the new SSID. This confirms saved router configuration, not that every client can reconnect.",
+            )
+        } catch (error: IOException) {
+            runCatching {
+                if (applyStarted) {
+                    rpc.call(sessionToken, "uci", "rollback", JSONObject().put("ubus_rpc_session", sessionToken))
+                } else {
+                    rpc.call(sessionToken, "uci", "revert", JSONObject().put("config", "wireless"))
+                }
+            }
+            throw error
+        }
+    }
+
+    private fun requireWirelessConfigMethods() {
+        val requiredMethods = setOf("get", "set", "changes", "revert", "apply", "confirm", "rollback")
+        val missing = requiredMethods.filterNot { capabilities.supports("uci", it) }
+        if (!capabilities.detected || missing.isNotEmpty()) {
+            throw WirelessConfigNotSupportedException(
+                if (!capabilities.detected) {
+                    "Router capabilities could not be detected; wireless configuration is unavailable."
+                } else {
+                    "Router does not advertise required UCI methods: ${missing.joinToString()}."
+                },
+            )
+        }
+    }
+
+    private fun validateSsid(ssid: String) {
+        require(ssid.isNotBlank() && ssid.toByteArray(Charsets.UTF_8).size <= MAX_SSID_BYTES) {
+            "SSID must contain 1 to $MAX_SSID_BYTES UTF-8 bytes"
+        }
+        require(ssid.none { it.isISOControl() }) { "SSID cannot contain control characters" }
+    }
+
+    private fun requireNoPendingUciChanges() {
+        val pending = rpc.call(sessionToken, "uci", "changes")
+        if ((pending.optJSONArray("changes")?.length() ?: 0) > 0) {
+            throw WirelessConfigNotSupportedException(
+                "This router session has pending UCI edits. Reconnect before changing the SSID.",
+            )
+        }
+    }
+
+    private fun readWirelessConfiguration(): JSONObject = rpc.call(
+        sessionToken,
+        "uci",
+        "get",
+        JSONObject().put("config", "wireless"),
+    ).takeIf { it.optJSONObject("values") != null }
+        ?: throw WirelessConfigNotSupportedException("Router did not return a readable wireless configuration.")
+
     fun logout() {
         if (loggedOut) return
         rpc.call(
@@ -254,11 +389,12 @@ class OpenWrtRouterSession internal constructor(
         objectName: String,
         methodName: String,
         issues: MutableList<String>,
+        arguments: JSONObject = JSONObject(),
     ): JSONObject? {
         if (!capabilities.supports(objectName, methodName)) return null
         if (transportError != null) return null
         return try {
-            rpc.call(sessionToken, objectName, methodName)
+            rpc.call(sessionToken, objectName, methodName, arguments)
         } catch (error: OpenWrtRpcException) {
             issues += "$objectName.$methodName failed: ${error.message}"
             null
@@ -297,7 +433,10 @@ class OpenWrtRouterSession internal constructor(
 
 class AccessControlNotSupportedException(message: String) : IOException(message)
 
+class WirelessConfigNotSupportedException(message: String) : IOException(message)
+
 private const val APPLY_ROLLBACK_TIMEOUT_SECONDS = 45
+private const val MAX_SSID_BYTES = 32
 
 private fun JSONObject.toSectionList(): List<JSONObject> {
     val keys = keys()
@@ -310,6 +449,28 @@ private fun JSONObject.hasNetwork(network: String): Boolean = when (val value = 
     is JSONArray -> (0 until value.length()).any { value.optString(it) == network }
     is String -> value.split(Regex("\\s+")).contains(network)
     else -> false
+}
+
+private fun JSONObject.wirelessNetworks(): List<RouterWirelessNetwork> {
+    val sections = optJSONObject("values")?.toSectionList().orEmpty()
+    val radios = sections
+        .filter { it.stringOrNull(".type") == "wifi-device" }
+        .associate { it.stringOrNull(".name") to it.stringOrNull("channel") }
+    return sections
+        .filter { it.stringOrNull(".type") == "wifi-iface" }
+        .mapNotNull { section ->
+            val name = section.stringOrNull(".name") ?: return@mapNotNull null
+            val radio = section.stringOrNull("device")
+            RouterWirelessNetwork(
+                sectionName = name,
+                mode = section.stringOrNull("mode"),
+                ssid = section.stringOrNull("ssid"),
+                radio = radio,
+                encryption = section.stringOrNull("encryption"),
+                channel = radios[radio],
+                disabled = section.stringOrNull("disabled") == "1",
+            )
+        }
 }
 
 private fun JSONObject.isOurPolicy(policy: InternetAccessPolicy): Boolean =

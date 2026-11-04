@@ -23,3 +23,13 @@ CI also validates APK existence, calculates a checksum, and publishes the APK ar
 - For this run, JDK 17 and Android Build Tools 35.0.0/platform 36 were installed in the workspace SDK after SDK license acceptance. Robolectric required `-Duser.home=/home/osama/Documents/Codex` because the default home directory is read-only.
 - DHCP leases use the router's interface-keyed `dhcp.ipv4leases` response; access control requires the reported interface to resolve to exactly one firewall zone with WAN forwarding. The operation verifies the saved UCI rule only; it cannot verify the selected device's actual internet connectivity.
 - **Router validation:** pending. No physical OpenWrt router is attached.
+
+## Milestone 5 — initial wireless configuration slice
+
+- Added OpenWrt wireless section discovery and a transactional SSID rename flow, with protocol tests for inspection, read-back confirmation, and rollback.
+- **Unit tests:** `testDebugUnitTest` passed; 26 tests, 0 failures, 0 errors, 0 skipped.
+- **Android lint:** `lintDebug` passed.
+- **APK assembly:** `assembleDebug` passed using JDK 21 and Android SDK 36 installed under `/tmp`.
+- **Debug APK:** `app/build/outputs/apk/debug/app-debug.apk` (version `0.3.0`, code 3; 18 MB).
+- **SHA-256:** `c788073d4dfcf68d7694720fda4134d42cc92522bc9caa86551773b910278257`.
+- **Physical router validation:** pending. No OpenWrt router is attached, and the change can interrupt wireless clients.

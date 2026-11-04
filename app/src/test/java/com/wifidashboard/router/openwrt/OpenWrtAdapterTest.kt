@@ -297,9 +297,155 @@ class OpenWrtAdapterTest {
         assertFalse(methods.contains("confirm"))
     }
 
+    @Test
+    fun wirelessInspectionReadsAccessPointSettingsAndRadioChannel() {
+        val transport = ResponseQueue(
+            success(JSONObject().put("ubus_rpc_session", "session")),
+            success(JSONObject().put("uci", methods("get"))),
+            success(wirelessConfig("Home network")),
+        )
+        val session = OpenWrtAdapter(transport).connect(
+            OpenWrtEndpoint.parse("https://router.local", allowCleartext = false),
+            RouterCredentials("root", "test-password"),
+        )
+
+        val snapshot = session.inspect()
+
+        assertEquals("Home network", snapshot.wirelessNetworks?.single()?.ssid)
+        assertEquals("radio0", snapshot.wirelessNetworks?.single()?.radio)
+        assertEquals("11", snapshot.wirelessNetworks?.single()?.channel)
+        assertEquals("psk2", snapshot.wirelessNetworks?.single()?.encryption)
+    }
+
+    @Test
+    fun wirelessSsidChangeUsesTimedApplyAndConfirmsOnlyAfterReadBack() {
+        val original = wirelessConfig("Old network")
+        val updated = wirelessConfig("New network")
+        val transport = ResponseQueue(
+            success(JSONObject().put("ubus_rpc_session", "session")),
+            success(wirelessWriteCapabilities()),
+            success(JSONObject().put("changes", JSONArray())),
+            success(original),
+            success(JSONObject().put("changes", JSONArray())),
+            success(original),
+            success(JSONObject()),
+            success(JSONObject()),
+            success(updated),
+            success(JSONObject()),
+        )
+        val session = OpenWrtAdapter(transport).connect(
+            OpenWrtEndpoint.parse("https://router.local", allowCleartext = false),
+            RouterCredentials("root", "test-password"),
+        )
+        val preview = session.previewWirelessSsid("cfg-ap", "New network")
+
+        val result = session.applyWirelessSsid(preview)
+
+        assertEquals(WirelessConfigState.APPLIED, result.state)
+        val calls = transport.requests.filter { it.getString("method") == "call" }
+            .map { it.getJSONArray("params") }
+        val methods = calls.map { "${it.getString(1)}.${it.getString(2)}" }
+        assertTrue(methods.contains("uci.set"))
+        assertTrue(methods.contains("uci.apply"))
+        assertTrue(methods.contains("uci.confirm"))
+        val applyArgs = calls.single { it.getString(2) == "apply" }.getJSONObject(3)
+        assertTrue(applyArgs.getBoolean("rollback"))
+        assertEquals(45, applyArgs.getInt("timeout"))
+        val setArgs = calls.single { it.getString(2) == "set" }.getJSONObject(3)
+        assertEquals("New network", setArgs.getJSONObject("values").getString("ssid"))
+    }
+
+    @Test
+    fun wirelessSsidChangeRefusesPendingUciEditsBeforeReadingWirelessConfig() {
+        val transport = ResponseQueue(
+            success(JSONObject().put("ubus_rpc_session", "session")),
+            success(wirelessWriteCapabilities()),
+            success(JSONObject().put("changes", JSONArray().put("firewall.rule=changed"))),
+        )
+        val session = OpenWrtAdapter(transport).connect(
+            OpenWrtEndpoint.parse("https://router.local", allowCleartext = false),
+            RouterCredentials("root", "test-password"),
+        )
+
+        assertThrows(WirelessConfigNotSupportedException::class.java) {
+            session.previewWirelessSsid("cfg-ap", "New network")
+        }
+        assertEquals(3, transport.requests.size)
+    }
+
+    @Test
+    fun wirelessSsidChangeDoesNotAllowRenamingStationInterfaces() {
+        val transport = ResponseQueue(
+            success(JSONObject().put("ubus_rpc_session", "session")),
+            success(wirelessWriteCapabilities()),
+            success(JSONObject().put("changes", JSONArray())),
+            success(wirelessConfig("Client network", mode = "sta")),
+        )
+        val session = OpenWrtAdapter(transport).connect(
+            OpenWrtEndpoint.parse("https://router.local", allowCleartext = false),
+            RouterCredentials("root", "test-password"),
+        )
+
+        assertThrows(WirelessConfigNotSupportedException::class.java) {
+            session.previewWirelessSsid("cfg-ap", "New network")
+        }
+        assertEquals(4, transport.requests.size)
+    }
+
+    @Test
+    fun wirelessSsidChangeRequestsRollbackWhenReadBackDoesNotMatch() {
+        val original = wirelessConfig("Old network")
+        val transport = ResponseQueue(
+            success(JSONObject().put("ubus_rpc_session", "session")),
+            success(wirelessWriteCapabilities()),
+            success(JSONObject().put("changes", JSONArray())),
+            success(original),
+            success(JSONObject().put("changes", JSONArray())),
+            success(original),
+            success(JSONObject()),
+            success(JSONObject()),
+            success(original),
+            success(JSONObject()),
+        )
+        val session = OpenWrtAdapter(transport).connect(
+            OpenWrtEndpoint.parse("https://router.local", allowCleartext = false),
+            RouterCredentials("root", "test-password"),
+        )
+        val preview = session.previewWirelessSsid("cfg-ap", "New network")
+
+        val result = session.applyWirelessSsid(preview)
+
+        assertEquals(WirelessConfigState.ROLLED_BACK, result.state)
+        val methods = transport.requests.filter { it.getString("method") == "call" }
+            .map { it.getJSONArray("params").getString(2) }
+        assertTrue(methods.contains("rollback"))
+        assertFalse(methods.contains("confirm"))
+    }
+
     private fun accessControlCapabilities(): JSONObject =
         JSONObject()
             .put("uci", methods("get", "add", "delete", "order", "changes", "revert", "apply", "confirm", "rollback"))
+
+    private fun wirelessWriteCapabilities(): JSONObject =
+        JSONObject()
+            .put("uci", methods("get", "set", "changes", "revert", "apply", "confirm", "rollback"))
+
+    private fun wirelessConfig(ssid: String, mode: String = "ap"): JSONObject =
+        JSONObject().put(
+            "values",
+            JSONObject()
+                .put(
+                    "cfg-radio",
+                    JSONObject().put(".type", "wifi-device").put(".name", "radio0")
+                        .put("channel", "11"),
+                )
+                .put(
+                    "cfg-ap",
+                    JSONObject().put(".type", "wifi-iface").put(".name", "cfg-ap")
+                        .put("mode", mode).put("ssid", ssid).put("device", "radio0")
+                        .put("encryption", "psk2"),
+                ),
+        )
 
     private fun firewallConfig(
         rule: JSONObject? = null,

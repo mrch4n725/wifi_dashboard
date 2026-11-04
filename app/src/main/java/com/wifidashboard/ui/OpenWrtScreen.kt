@@ -45,6 +45,9 @@ import com.wifidashboard.router.openwrt.RouterClient
 import com.wifidashboard.router.openwrt.RouterCredentialStore
 import com.wifidashboard.router.openwrt.RouterCredentials
 import com.wifidashboard.router.openwrt.RouterSnapshot
+import com.wifidashboard.router.openwrt.RouterWirelessNetwork
+import com.wifidashboard.router.openwrt.WirelessConfigState
+import com.wifidashboard.router.openwrt.WirelessSsidPreview
 import com.wifidashboard.storage.DeviceIdentity
 import com.wifidashboard.storage.AccessControlEventEntity
 import com.wifidashboard.storage.DeviceObservation
@@ -79,6 +82,9 @@ fun OpenWrtScreen(
     var message by remember { mutableStateOf<String?>(null) }
     var pendingPreview by remember { mutableStateOf<InternetAccessPreview?>(null) }
     var pendingClient by remember { mutableStateOf<RouterClient?>(null) }
+    var editingWireless by remember { mutableStateOf<RouterWirelessNetwork?>(null) }
+    var wirelessSsidDraft by remember { mutableStateOf("") }
+    var pendingWirelessPreview by remember { mutableStateOf<WirelessSsidPreview?>(null) }
     val auditEvents by repository.observeRecentAccessControlEvents()
         .collectAsStateWithLifecycle(initialValue = emptyList())
 
@@ -109,6 +115,33 @@ fun OpenWrtScreen(
                 throw error
             } catch (error: IOException) {
                 message = error.message ?: "Router could not prepare an access-control preview."
+            } finally {
+                busy = false
+            }
+        }
+    }
+
+    fun requestWirelessPreview(network: RouterWirelessNetwork) {
+        val activeSession = session ?: run {
+            message = "Connect to the router before changing wireless settings."
+            return
+        }
+        busy = true
+        message = "Checking router wireless configuration…"
+        scope.launch {
+            try {
+                val preview = withContext(Dispatchers.IO) {
+                    activeSession.previewWirelessSsid(network.sectionName, wirelessSsidDraft)
+                }
+                pendingWirelessPreview = preview
+                editingWireless = null
+                message = null
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: IOException) {
+                message = error.message ?: "Router could not prepare a wireless settings preview."
+            } catch (error: IllegalArgumentException) {
+                message = error.message ?: "Enter a valid Wi-Fi name."
             } finally {
                 busy = false
             }
@@ -353,6 +386,10 @@ fun OpenWrtScreen(
                 snapshot = latest,
                 onBlock = { requestAccessChange(it, InternetAccessAction.BLOCK) },
                 onRestore = { requestAccessChange(it, InternetAccessAction.RESTORE) },
+                onRenameWireless = {
+                    wirelessSsidDraft = it.ssid.orEmpty()
+                    editingWireless = it
+                },
             )
         }
         if (auditEvents.isNotEmpty()) AccessControlAudit(auditEvents)
@@ -473,6 +510,100 @@ fun OpenWrtScreen(
             },
         )
     }
+
+    editingWireless?.let { network ->
+        AlertDialog(
+            onDismissRequest = { if (!busy) editingWireless = null },
+            title = { Text("Change Wi-Fi name") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("${network.ssid} · ${network.encryption ?: "security unavailable"}")
+                    OutlinedTextField(
+                        value = wirelessSsidDraft,
+                        onValueChange = { wirelessSsidDraft = it },
+                        label = { Text("New Wi-Fi name") },
+                        singleLine = true,
+                        enabled = !busy,
+                    )
+                    Text(
+                        "Changing this name may disconnect every wireless client. The router change uses a 45-second rollback window.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            },
+            confirmButton = {
+                Button(onClick = { requestWirelessPreview(network) }, enabled = !busy) { Text("Review change") }
+            },
+            dismissButton = {
+                TextButton(onClick = { editingWireless = null }, enabled = !busy) { Text("Cancel") }
+            },
+        )
+    }
+
+    pendingWirelessPreview?.let { wirelessPreview ->
+        AlertDialog(
+            onDismissRequest = { if (!busy) pendingWirelessPreview = null },
+            title = { Text("Apply Wi-Fi name change?") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("${wirelessPreview.network.ssid} → ${wirelessPreview.newSsid}")
+                    Text("Only this access point's SSID will be changed. Wireless passwords and other router settings will remain untouched.")
+                    Text("The router will apply the change with a 45-second rollback window. Saved configuration read-back does not prove that clients can reconnect.")
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val activeSession = session ?: return@Button
+                        busy = true
+                        message = "Applying wireless settings…"
+                        scope.launch {
+                            try {
+                                val result = withContext(Dispatchers.IO) {
+                                    repository.recordWirelessConfigAudit(
+                                        state = "REQUESTED",
+                                        detail = "Administrator confirmed an SSID change for section ${wirelessPreview.network.sectionName}.",
+                                    )
+                                    activeSession.applyWirelessSsid(wirelessPreview).also { applied ->
+                                        repository.recordWirelessConfigAudit(
+                                            state = applied.state.name,
+                                            detail = applied.message,
+                                        )
+                                    }
+                                }
+                                message = result.message
+                                if (result.state == WirelessConfigState.APPLIED) {
+                                    try {
+                                        snapshot = withContext(Dispatchers.IO) { activeSession.inspect() }
+                                    } catch (refreshError: IOException) {
+                                        message = "${result.message} Router refresh failed: ${refreshError.message ?: "router unavailable"}."
+                                    }
+                                }
+                            } catch (error: CancellationException) {
+                                throw error
+                            } catch (error: IOException) {
+                                withContext(Dispatchers.IO) {
+                                    repository.recordWirelessConfigAudit(
+                                        state = "FAILED",
+                                        detail = "Router did not confirm the requested SSID change; review the router and reconnect if needed.",
+                                    )
+                                }
+                                message = error.message ?: "Router wireless settings could not be applied."
+                            } finally {
+                                pendingWirelessPreview = null
+                                busy = false
+                            }
+                        }
+                    },
+                    enabled = !busy,
+                ) { Text("Confirm and apply") }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingWirelessPreview = null }, enabled = !busy) { Text("Cancel") }
+            },
+        )
+    }
 }
 
 @Composable
@@ -480,6 +611,7 @@ private fun RouterInformation(
     snapshot: RouterSnapshot,
     onBlock: (RouterClient) -> Unit,
     onRestore: (RouterClient) -> Unit,
+    onRenameWireless: (RouterWirelessNetwork) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         RouterCard(
@@ -511,6 +643,55 @@ private fun RouterInformation(
                 ).joinToString(" · ")
             } ?: listOf("Interface data" to "Not supported by this router"),
         )
+        Text(
+            "WIRELESS CONFIGURATION",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.primary,
+            fontWeight = FontWeight.Bold,
+        )
+        val canEditWireless = listOf("get", "set", "changes", "revert", "apply", "confirm", "rollback")
+            .all { snapshot.capabilities.supports("uci", it) }
+        val wirelessNetworks = snapshot.wirelessNetworks
+        if (wirelessNetworks == null) {
+            Text(
+                "Wireless configuration is not advertised or readable through this router's UCI interface.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        } else if (wirelessNetworks.isEmpty()) {
+            Text("The router returned no wireless access-point sections.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        if (wirelessNetworks != null && !canEditWireless) {
+            Text(
+                "SSID changes are unavailable because this router does not advertise the required transactional UCI methods.",
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        wirelessNetworks.orEmpty().forEach { network ->
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceContainerHigh),
+            ) {
+                Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(network.ssid ?: "SSID unavailable", fontWeight = FontWeight.SemiBold)
+                    Text(
+                        listOfNotNull(
+                            network.mode,
+                            network.encryption,
+                            network.radio,
+                            network.channel?.let { "channel $it" },
+                            if (network.disabled) "disabled" else null,
+                        ).joinToString(" · ").ifBlank { "Wireless details unavailable" },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    TextButton(
+                        onClick = { onRenameWireless(network) },
+                        enabled = canEditWireless && network.mode == "ap" && !network.disabled && network.ssid != null,
+                    ) { Text("Change SSID") }
+                }
+            }
+        }
         val reportedClients = (snapshot.dhcpLeases + snapshot.wirelessClients)
             .distinctBy { it.macAddress?.lowercase() ?: "${it.source}:${it.ipAddress}:${it.hostname}" }
         Text(
@@ -569,10 +750,14 @@ private fun RouterInformation(
 @Composable
 private fun AccessControlAudit(events: List<AccessControlEventEntity>) {
     RouterCard(
-        "RECENT ACCESS CONTROL AUDIT",
+        "RECENT ROUTER ACTION AUDIT",
         events.map { event ->
             "${event.action} · ${event.state} · ${event.deviceLabel}" to
-                "${event.macAddress} · ${DateFormat.getDateTimeInstance().format(Date(event.occurredAt))} · ${event.detail}"
+                listOfNotNull(
+                    event.macAddress.takeIf(String::isNotBlank),
+                    DateFormat.getDateTimeInstance().format(Date(event.occurredAt)),
+                    event.detail,
+                ).joinToString(" · ")
         },
     )
 }
@@ -609,6 +794,20 @@ private fun RouterClient.displayName(): String =
 private fun RouterClient.displayAddress(): String =
     listOfNotNull(ipAddress, macAddress, details, source).joinToString(" · ")
         .ifBlank { "Router reported no address details" }
+
+    private suspend fun DeviceRepository.recordWirelessConfigAudit(state: String, detail: String) {
+        recordAccessControlEvent(
+            AccessControlEventEntity(
+                deviceId = "router:active",
+                deviceLabel = "Router wireless configuration",
+                macAddress = "",
+                action = "SSID_CHANGE",
+                state = state,
+                occurredAt = System.currentTimeMillis(),
+                detail = detail,
+            ),
+        )
+    }
 
 private fun formatDuration(seconds: Long): String {
     val days = seconds / 86_400
